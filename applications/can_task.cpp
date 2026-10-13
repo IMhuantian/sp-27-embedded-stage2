@@ -1,22 +1,23 @@
 /*
- * 姿态与电机联动 + CAN 收发
+ * 第二阶段: 底盘控制 + CAN 收发 (规则书 4.4.2.2 遥控器与底盘控制 / 4.4.2.3 功率控制)
  *
- * 硬件接法：C板 + 两台 GM6020，都在 CAN1 上，电机 ID 分别拨到 1(A) 和 2(B)。
- * 上电前先把三个指向标箭头对到一起，程序会拿上电瞬间的电机读数当机械零位。
+ * 硬件: 4×RM3508 + C620 电调, 接 CAN1(PD0/PD1), ID = 1/2/3/4(电调指示灯设定)
+ *       功率计接 CAN2(0x301 两条总线都会收), 标准帧 8 字节
  *
- * 三个旋转输入端是同轴的，统一用"绕 yaw 轴逆时针为正"的机械角来描述：
- *     C板转角   phi_C = YAW_DIR * yaw - psi0
- *     A电机转角 phi_A = A_DIR * (motorA.angle - a0)
- *     B电机转角 phi_B = B_DIR * (motorB.angle - b_ref0)
+ * 4.4.2.2 遥控映射(与本文件实现一一对应):
+ *   右拨杆下档 → 全部电机失能(最高优先级, 每周期发 0 转矩)
+ *   右拨杆中档 → 底盘可动
+ *   左摇杆前后 → 前后移动                        (ch_lv)
+ *   左摇杆左右 → 横向移动                        (ch_lh)
+ *   左拨轮     → 原地旋转, 满量程目标角速度 1rad/s (ch_lu)
+ *   右拨杆上档 → 本实现按失能处理(规则书未定义该档功能, 保守处理)
  *
- * 右拨杆中档时按下面的关系联动：
- *     phi_A = phi_C
- *     phi_B = k * phi_C        k 由左拨杆定：下档 +0.5、中档 -1、上档 +3
+ * 控制链: 摇杆死区 → 目标速度斜坡 → 麦克纳姆解算 → 每轮速度环 PID
+ *         → 功率模型等比限流 → cmd(轮侧转矩 N·m)
+ *         同时用四轮实测转速反解车体速度(vx/vy/wz), 与目标/反馈/控制量一起送 SerialPlot。
  *
- * 手动拖动电机时重算 psi0 或 b_ref0，拖完之后转 C 板从新位置继续跟，不会弹回原零位。
- * 右拨杆下档失能、上档复位。
- *
- * 两台 GM6020 的 ID 都小于 5，控制帧 ID 都是 0x1FE，两条指令要写进同一帧只 send 一次。
+ * ⚠️ 用法: 先按 CHASSIS_MOTION_ENABLE = false 编译烧录做 M2(纯失能, 交指定人员检查),
+ *          检查通过后改成 true 再做 M3(运动, 车轮离地 + 低限幅)。
  */
 
 #include <cmath>
@@ -27,370 +28,371 @@
 #include "motor/rm_motor/rm_motor.hpp"
 #include "tools/mahony/mahony.hpp"
 #include "tools/math_tools/math_tools.hpp"
+#include "tools/mecanum/mecanum.hpp"
 #include "tools/pid/pid.hpp"
 
 namespace
 {
-// 方向标定：装反了就把对应那一项改成 -1
-constexpr float YAW_DIR = +1.0f;
-constexpr float A_DIR = +1.0f;
-constexpr float B_DIR = +1.0f;
+// ===== M2/M3 总开关: false = 只保留失能逻辑(给安全检查烧录的版本), true = 允许运动 =====
+constexpr bool CHASSIS_MOTION_ENABLE = true;
 
-// 左拨杆对应的联动比
-constexpr float K_LEFT_DOWN = +0.5f;
-constexpr float K_LEFT_MID = -1.0f;
-constexpr float K_LEFT_UP = +3.0f;
+// ===== 电调 ID 自检模式: true = 只报 4 个 CAN ID 有没有反馈, 禁止一切运动 =====
+// 用法: 改成 true 烧录 → SerialPlot 看通道 0/1/2/3 = ID 1/2/3/4 是否在线(1=在线, 0=不在线)。
+// 用途: 确认 C620 的 ID 到底设成了几号(见 指导文档\第二阶段-电调ID设置与确认.md)。
+// 自检做完必须改回 false, 否则底盘永远不会动。
+constexpr bool ID_CHECK_MODE = false;
 
-// 位置环参数，输出单位 N·m（GM6020 上限大概 2.22 N·m）
-constexpr float PID_DT = 1e-3f;   // 控制周期 1ms，跟 osDelay(1) 对上
-constexpr float POS_KP = 1.2f;
-constexpr float POS_KI = 0.0f;    // 用纯 PD，带积分的话手动拖动会松手回弹
-constexpr float POS_KD = 0.03f;
-constexpr float POS_MAX_OUT = 1.0f;
-constexpr float POS_MAX_IOUT = 0.3f;
-constexpr float POS_ALPHA = 0.8f;  // D 项滤波系数，1 是不滤波
+// ---- 机械参数(规则书 4.4.2.2) ----
+constexpr float WHEEL_R = 0.077f;  // 轮半径 m (轮径 154mm)
+constexpr float HALF_L = 0.165f;   // 纵向半间距 m (纵向间距 330mm)
+constexpr float HALF_W = 0.185f;   // 横向半间距 m (横向间距 370mm)
 
-// 拖动检测
-constexpr float DRAG_TOL = 0.08f;        // rad，判为手拖的位置偏差阈值
-constexpr float DRAG_DECAY = 0.002f;     // rad，偏差每周期至少收敛这么多才算电机在追指令
-constexpr uint32_t DRAG_CONFIRM_MS = 20; // 偏差持续不收敛多久才判为手拖
-constexpr uint32_t DRAG_HOLD_MS = 500;   // 主导电机的保持时间
-constexpr float CBOARD_STILL = 0.0015f;  // rad/ms，一个周期内 C 板转这么少就算它没动
-constexpr uint32_t SW_DEBOUNCE_MS = 30;  // 拨杆换档消抖
+// ---- 减速比: 按导师确认的口径取 14.9:1 ----
+// 作用: RM_Motor 用它把电机侧原始数据换算成输出轴量纲 ——
+//   speed = rpm/60×2π/ratio (轮侧 rad/s)、torque = current×Kt×ratio (轮侧 N·m)、cmd() 也是轮侧 N·m。
+// 后果: 20A 对应的轮侧转矩 = (0.3/19.203)×20×14.9 ≈ 4.66 N·m (用 19.203 时是 6 N·m)。
+// 若哪天实测发现是 19.203:1, 只改这一行即可(读数会整体差 1.29 倍)。
+// ⚠️ 库里的 sp::M3508_P19(≈19.203) 不要用于这里。
+constexpr float GEAR_RATIO = 14.9f;
 
-// 目标斜率限幅，避免换档或刚进联动时电机猛冲
-constexpr float REF_RATE = 5.0f;  // rad/s
+// ---- 速度限幅 ----
+constexpr float V_MAX = 1.0f;   // 车体线速度上限 m/s (首测 1.0, 稳定后逐步放)
+constexpr float WZ_MAX = 1.0f;  // 旋转角速度上限 rad/s (规则书: 拨轮满量程 = 1)
 
-// 复位到位的判定
-constexpr float HOME_TOL = 0.08f;  // rad
+// ---- 摇杆死区(4.4.2.2 "方向应与操作者输入一致": 没死区时摇杆回中抖动会让底盘自己爬) ----
+// DT7 回中抖动实测在 ±0.01 量级; 死区内输出 0, 死区外线性重映射(过零连续, 满量程仍是 ±1)
+constexpr float STICK_DEADZONE = 0.02f;
+
+// ---- 目标速度斜坡(4.4.2.2 "直线行驶时应尽量减小偏航、振荡"; 同时充当软启动) ----
+constexpr float V_SLEW = 3.0f;  // 车体线速度变化率上限 m/s² (0 → 1m/s 约 0.33s)
+constexpr float W_SLEW = 4.0f;  // 角速度变化率上限 rad/s²
+
+// ---- 方向标定(试车发现反了就把对应项改 -1, 不要动机械) ----
+// 这三项按"遥控器通道极性 × sp::Mecanum 约定"推出来, 不是猜的:
+//   dbus.hpp:70-72  ch_lv 上正下负 | ch_lh 右正左负 | ch_lu 左正右负
+//   mecanum.hpp:32-34  vx 前进为正 | vy 左移为正 | wz 逆时针(右手螺旋)为正
+// 所以"推杆方向 = 车动方向"要求: vx=+ch_lv, vy=-ch_lh, wz=+ch_lu
+constexpr float FWD_DIR = +1.0f;   // ch_lv 上推(+) = 前进
+constexpr float SIDE_DIR = -1.0f;  // ch_lh 右推(+) 要得到"右移", 而 vy 正方向是左移 → 取负
+constexpr float ROT_DIR = +1.0f;   // ch_lu 左推(+) = 左转, 而 wz 正方向就是逆时针(左转) → 取正
+
+// ---- 每轮速度环, 输出 = 轮侧转矩 N·m ----
+constexpr float SPD_DT = 1e-3f;      // 与控制周期 osDelay(1) 一致
+constexpr float SPD_KP = 1.0f;       // 整定起点, 见指南 M4
+constexpr float SPD_KI = 0.2f;
+constexpr float SPD_KD = 0.0f;
+constexpr float SPD_MAX_OUT = 1.0f;  // 单轮转矩限幅 N·m (总输出限幅), 首测 1.0, 稳定后放 3.0
+constexpr float SPD_MAX_IOUT = 0.5f; // 积分分项限幅(防积分饱和)
+constexpr float SPD_ALPHA = 0.8f;    // 反馈低通
+
+// ---- M4: 直线行驶的偏航锁定(可选). 建议先用 false 把基本运动跑通, 再开来对比效果 ----
+constexpr bool STRAIGHT_LOCK_ENABLE = false;
+constexpr float YAW_KP = 0.6f;         // 偏航修正 P: 输出 rad/s / 偏差 rad
+constexpr float YAW_KD = 0.05f;        // 用 imu.vyaw 做阻尼
+constexpr float YAW_MAX = 0.25f;       // 偏航修正的上限 rad/s, 不允许抢主控制
+constexpr float STRAIGHT_EPS = 0.10f;  // |ch_lh|、|ch_lu| 都小于它才算"在走直线"
+// ⚠️ 符号标定(开启偏航锁定前必做): 失能状态下把车放平、俯视逆时针转 ~90°。
+//    若 imu.yaw 变大 → 与麦克纳姆 wz(逆时针为正)同号 → 保持 +1;
+//    若 imu.yaw 变小(例如 C 板倒装/绕 z 轴反向) → 改成 -1, 否则闭环变正反馈, 车会自己打转。
+constexpr float YAW_SIGN = +1.0f;
+
+// ---- 功率模型(4.4.2.3, 整定见指南 M5) ----
+// K1/K2 必须与喂进来的 τ、ω 同口径: 本文件用的是轮侧 τ(N·m)、轮侧 ω(rad/s),
+// 与参考资料《底盘功率控制》的口径一致(主项 Στ·ω 与取哪一侧无关; 若哪天改用电机侧量纲,
+// 修正项系数要按 i² 重算: K1/i²、K2×i²)。下面只是参考初值, 必须按 M5 流程自己整定。
+constexpr float POWER_LIMIT_W = 60.0f;  // ⚠️ 占位! 实际上限值必须问导师
+constexpr float K1 = 2.0f;              // Στ² 系数(轮侧口径初值)
+constexpr float K2 = 0.01f;             // Σω² 系数(轮侧口径初值)
+constexpr float K3 = 2.0f;              // 静态功耗 W(静止实测整定)
 }  // namespace
 
+// ---- 底盘 4×C620 接在哪条 CAN 上（**接线必须与这里一致**）----
+// CAN1 = C 板上 2-pin 口（黑 CANL / 红 CANH）；CAN2 = 4-pin 口（灰 CANL / 灰 CANH / 灰 GND / 红 5V）
+// 已确认(2026/10/13): 底盘电机接 **CAN1**, 功率计接 CAN2。
+// 注意: 代码对两条总线都 config()+start() 且都解析 0x301, 所以功率计插错口也不会瞎。
+// 另一条总线同时留给以后云台的 GM6020。
+constexpr bool MOTORS_ON_CAN1 = true;
+
 sp::CAN can1(&hcan1);
-sp::RM_Motor motorA(1, sp::RM_Motors::GM6020);
-sp::RM_Motor motorB(2, sp::RM_Motors::GM6020);
+sp::CAN can2(&hcan2);
+sp::CAN & mcan = MOTORS_ON_CAN1 ? can1 : can2;  // 底盘电机所在总线: 发 0x200 / 收 0x201~0x204
+sp::CAN & ocan = MOTORS_ON_CAN1 ? can2 : can1;  // 另一条: 只收 0x301(功率计)
 
-extern sp::DBus remote;  // 在 applications/uart_task.cpp 里
-extern sp::Mahony imu;   // 在 applications/imu_task.cpp 里
+// 第三个参数 = 减速比, 必须显式传 GEAR_RATIO:
+// 默认值 1.0f 会让 speed/torque 变成"电机侧"量纲, 且 cmd() 的量程会差一个减速比。
+sp::RM_Motor wheel_lf(1, sp::RM_Motors::M3508, GEAR_RATIO);
+sp::RM_Motor wheel_rf(2, sp::RM_Motors::M3508, GEAR_RATIO);
+sp::RM_Motor wheel_lr(3, sp::RM_Motors::M3508, GEAR_RATIO);
+sp::RM_Motor wheel_rr(4, sp::RM_Motors::M3508, GEAR_RATIO);
 
-// 给 plotter_task 看的调试量
-float linkage_ref_a = 0.0f;
-float linkage_ref_b = 0.0f;
-float linkage_phi_c = 0.0f;
-float linkage_k = 0.0f;
+// 默认右轮按"反装"解算(reverse_rf/rr = true), 试车发现某轮转向不对就把对应 bool 翻过来
+sp::Mecanum mec(WHEEL_R, HALF_L, HALF_W);
+
+sp::PID spd_lf(SPD_DT, SPD_KP, SPD_KI, SPD_KD, SPD_MAX_OUT, SPD_MAX_IOUT, SPD_ALPHA);
+sp::PID spd_rf(SPD_DT, SPD_KP, SPD_KI, SPD_KD, SPD_MAX_OUT, SPD_MAX_IOUT, SPD_ALPHA);
+sp::PID spd_lr(SPD_DT, SPD_KP, SPD_KI, SPD_KD, SPD_MAX_OUT, SPD_MAX_IOUT, SPD_ALPHA);
+sp::PID spd_rr(SPD_DT, SPD_KP, SPD_KI, SPD_KD, SPD_MAX_OUT, SPD_MAX_IOUT, SPD_ALPHA);
+
+extern sp::DBus remote;  // applications/uart_task.cpp
+extern sp::Mahony imu;   // applications/imu_task.cpp
+
+// 功率计(0x301): data[0..1]=电流×100, [2..3]=电压×100, [4..5]=功率×100, [6..7]=0
+float pm_current = 0.0f;  // A
+float pm_voltage = 0.0f;  // V
+float pm_power = 0.0f;    // W
+float p_pred = 0.0f;      // 模型预测功率 W
+float k_power = 1.0f;     // 当前功率限流系数
+
+// 目标速度斜坡状态(失能时清零 → 每次恢复运动都从 0 平滑起步, 不会突然窜出去)
+float vx_ramp = 0.0f;
+float vy_ramp = 0.0f;
+float wz_ramp = 0.0f;
+
+// 给 plotter_task 的 12 通道(SerialPlot 一帧 = 3 + 12×4 = 51 字节, 921600 下 1ms 周期够用):
+// 0 目标轮速(左前) 1 实际轮速(左前) 2 控制量(左前) 3/4/5 右前/左后/右后实际轮速
+// 6 偏航 yaw 7 预测功率 8 功率计实测功率
+// 9/10/11 车体实测 vx/vy/wz(由四轮反馈反解) ← 规则书"车体速度"与直线行驶证据
+float plot_ch[12] = {0};
+
+// 直线偏航锁定状态
+bool yaw_lock_active = false;
+float yaw_set = 0.0f;
 
 namespace
 {
-struct LinkageState
+// 失能: 每周期向 4 台电机发 0 转矩指令, 清 PID 积分, 复位限流系数。
+// 失能状态具有最高优先级, 任何其它代码路径不得恢复输出(规则书 4.4.2.2)。
+void disable_all()
 {
-  bool inited = false;     // 上电标定做完了没有
-  bool armed = false;      // 中档联动是不是已经对齐起点
-  bool reset_done = false; // 上档复位到位了没有
-  float psi0_mech = 0.0f;  // 联动参考零点（机械角）
-  float a0 = 0.0f;         // A 电机上电时的读数，也就是箭头对齐位
-  float b0 = 0.0f;         // B 电机同上
-  float ref_a = 0.0f;      // A 的目标（motorA.angle 空间）
-  float ref_b = 0.0f;
-  float last_yaw = 0.0f;
-  float dev_a = 0.0f;      // A 上一周期的位置偏差
-  float dev_b = 0.0f;      // B 上一周期的位置偏差
-  uint32_t dev_ms = 0;     // 偏差开始不收敛的时刻
-  uint8_t leader = 0;      // 判定为被拖动的电机：0 无 / 1 A / 2 B
-  uint32_t leader_ms = 0;  // 主导电机的认定时刻
-  sp::DBusSwitchMode last_sw_r = sp::DBusSwitchMode::DOWN;
-  sp::DBusSwitchMode pending_sw_r = sp::DBusSwitchMode::DOWN;  // 消抖候选档位
-  uint32_t sw_ms = 0;      // 候选档位出现的时刻
-  float b_ref0 = 0.0f;     // B 的比例基准：ref_b = b_ref0 + B_DIR*(k*phi_c)
-  sp::DBusSwitchMode last_sw_l = sp::DBusSwitchMode::MID;
-  sp::DBusSwitchMode pending_sw_l = sp::DBusSwitchMode::MID;
-  uint32_t sw_l_ms = 0;    // 左拨杆候选档位出现的时刻
-};
-
-LinkageState g;
-
-sp::PID pid_a(PID_DT, POS_KP, POS_KI, POS_KD, POS_MAX_OUT, POS_MAX_IOUT, POS_ALPHA);
-sp::PID pid_b(PID_DT, POS_KP, POS_KI, POS_KD, POS_MAX_OUT, POS_MAX_IOUT, POS_ALPHA);
-
-// 每个周期最多走 max_step，把 cur 慢慢逼近 target
-float slew(float cur, float target, float max_step)
-{
-  float d = target - cur;
-  if (d > max_step) d = max_step;
-  if (d < -max_step) d = -max_step;
-  return cur + d;
+  wheel_lf.cmd(0.0f);
+  wheel_rf.cmd(0.0f);
+  wheel_lr.cmd(0.0f);
+  wheel_rr.cmd(0.0f);
+  spd_lf.clear();
+  spd_rf.clear();
+  spd_lr.clear();
+  spd_rr.clear();
+  k_power = 1.0f;
+  yaw_lock_active = false;  // 下次恢复运动时重新锁存偏航零点
+  vx_ramp = 0.0f;           // 斜坡状态清零: 下次恢复运动从 0 起步(软启动)
+  vy_ramp = 0.0f;
+  wz_ramp = 0.0f;
+  // 让 SerialPlot 上直接看出"已失能": 目标/控制量归零(实际轮速仍显示真实值)
+  plot_ch[0] = 0.0f;
+  plot_ch[2] = 0.0f;
+  p_pred = 0.0f;
 }
 
-float left_ratio(sp::DBusSwitchMode sw_l)
+// 摇杆死区 + 线性重映射: 死区内归零, 死区外保证过零连续且推满时仍输出 ±1(不损失满量程)
+float stick(float v, float dz)
 {
-  switch (sw_l) {
-    case sp::DBusSwitchMode::DOWN:
-      return K_LEFT_DOWN;
-    case sp::DBusSwitchMode::MID:
-      return K_LEFT_MID;
-    default:
-      return K_LEFT_UP;
-  }
+  const float a = fabsf(v);
+  if (a <= dz) return 0.0f;
+  return (v > 0.0f ? 1.0f : -1.0f) * (a - dz) / (1.0f - dz);
 }
 
-// 相对上电对齐位的机械转角
-float phi_A() { return A_DIR * (motorA.angle - g.a0); }
-float phi_B() { return B_DIR * (motorB.angle - g.b_ref0); }
-
-void linkage_step()
+// 一阶斜坡限幅: 每个控制周期最多变化 rate×dt (防阶跃冲击与振荡, 兼作软启动)
+float slew(float now, float target, float rate, float dt)
 {
-  const float mech_yaw = YAW_DIR * imu.yaw;
-  const float dyaw = sp::limit_angle(imu.yaw - g.last_yaw);
-  g.last_yaw = imu.yaw;
+  const float lim = rate * dt;
+  const float d = target - now;
+  if (d > lim) return now + lim;
+  if (d < -lim) return now - lim;
+  return target;
+}
 
+void parse_power(const uint8_t * d)
+{
+  pm_current = (float)(int16_t)((d[0] << 8) | d[1]) / 100.0f;   // A
+  pm_voltage = (float)(uint16_t)((d[2] << 8) | d[3]) / 100.0f;  // V
+  pm_power = (float)(uint16_t)((d[4] << 8) | d[5]) / 100.0f;    // W
+}
+
+// 预测功率超限时把 4 轮转矩等比缩小 K'。
+// P = Σ(τ·ω) + K1·Στ² + K2·Σω² + K3, 令 τ' = K'·τ 代入 P = Pmax:
+//   K1·Στ²·K'² + Σ(τ·ω)·K' + (K2·Σω² + K3 − Pmax) = 0, 取正根。
+float power_scale(float t1, float w1, float t2, float w2, float t3, float w3, float t4, float w4)
+{
+  const float sum_tw = t1 * w1 + t2 * w2 + t3 * w3 + t4 * w4;
+  const float sum_t2 = t1 * t1 + t2 * t2 + t3 * t3 + t4 * t4;
+  const float sum_w2 = w1 * w1 + w2 * w2 + w3 * w3 + w4 * w4;
+  p_pred = sum_tw + K1 * sum_t2 + K2 * sum_w2 + K3;
+  if (p_pred <= POWER_LIMIT_W) return 1.0f;
+
+  const float a = K1 * sum_t2;
+  const float b = sum_tw;
+  const float c = K2 * sum_w2 + K3 - POWER_LIMIT_W;
+  const float disc = b * b - 4.0f * a * c;
+  // 兜底: 判别式<0 只可能发生在 c>0(即"零转矩下预测功率都已超限")——此时 K'∈[0,1] 内
+  // 功率随 K' 单调上升, 最小值在 K'=0, 所以直接给 0 转矩最安全(而不是给一个固定系数)
+  if (a <= 0.0f || disc < 0.0f) return 0.0f;
+
+  float k = (-b + sqrtf(disc)) / (2.0f * a);
+  if (k > 1.0f) k = 1.0f;
+  if (k < 0.0f) k = 0.0f;
+  return k;
+}
+
+void chassis_step()
+{
   const uint32_t now = osKernelSysTick();
 
-  // 电机还没上来反馈数据，连零位都还没法定，一律失能
-  if (!motorA.is_open() || !motorB.is_open()) {
-    motorA.cmd(0.0f);
-    motorB.cmd(0.0f);
-    pid_a.clear();
-    pid_b.clear();
-    g.inited = false;
-    g.armed = false;
-    g.reset_done = false;
-    linkage_ref_a = g.ref_a;
-    linkage_ref_b = g.ref_b;
-    linkage_phi_c = 0.0f;
-    linkage_k = 0.0f;
+  // ---- 电调 ID 自检(诊断模式, 优先于一切): 只报告 4 个 CAN ID 是否在线, 绝不运动 ----
+  // 必须放在"三层失能"之前: ID 设错时那台电机本来就没有反馈, 若先判失能就永远看不到结果。
+  if (ID_CHECK_MODE) {
+    disable_all();
+    const bool t = (now >= 2000u);                         // 上电 2s 后再判定(之前一律 0)
+    plot_ch[0] = (t && wheel_lf.is_open()) ? 1.0f : 0.0f;  // CAN ID 1 (左前)
+    plot_ch[1] = (t && wheel_rf.is_open()) ? 1.0f : 0.0f;  // CAN ID 2 (右前)
+    plot_ch[2] = (t && wheel_lr.is_open()) ? 1.0f : 0.0f;  // CAN ID 3 (左后)
+    plot_ch[3] = (t && wheel_rr.is_open()) ? 1.0f : 0.0f;  // CAN ID 4 (右后)
     return;
   }
 
-  // 上电标定：把当前位置当成三个箭头对齐的机械零位。只看电机，不等遥控器
-  if (!g.inited) {
-    g.inited = true;
-    g.a0 = motorA.angle;
-    g.b0 = motorB.angle;
-    g.b_ref0 = motorB.angle;
-    g.psi0_mech = mech_yaw;
-    g.ref_a = motorA.angle;
-    g.ref_b = motorB.angle;
-    g.armed = false;
-    g.reset_done = false;
-    pid_a.clear();
-    pid_b.clear();
-  }
-
-  // 遥控器失联就一律失能，零位留着不重标
-  if (!remote.is_alive(now)) {
-    motorA.cmd(0.0f);
-    motorB.cmd(0.0f);
-    pid_a.clear();
-    pid_b.clear();
-    g.armed = false;
-    g.reset_done = false;
-    linkage_ref_a = g.ref_a;
-    linkage_ref_b = g.ref_b;
-    linkage_phi_c = 0.0f;
-    linkage_k = 0.0f;
+  // ---- 三层失能(最高优先级): 电机反馈中断 / 遥控器失联 / 右拨杆下档 ----
+  // is_alive() = 距上次收到该电机反馈 < 100ms(见 rm_motor.cpp:103), 比 is_open() 更严:
+  // 运行中拔掉/压断某台 C620 的通信线, 会立刻整机进入失能(单轮速度环失去反馈会失控)。
+  if (
+    !wheel_lf.is_alive(now) || !wheel_rf.is_alive(now) || !wheel_lr.is_alive(now) ||
+    !wheel_rr.is_alive(now) || !remote.is_alive(now) || remote.sw_r == sp::DBusSwitchMode::DOWN) {
+    disable_all();
     return;
   }
 
-  // 右拨杆换档消抖，新档位稳定 SW_DEBOUNCE_MS 后才切换；下面的分支都用消抖后的档位
-  if (remote.sw_r != g.pending_sw_r) {
-    g.pending_sw_r = remote.sw_r;
-    g.sw_ms = now;
-  } else if (g.pending_sw_r != g.last_sw_r && (now - g.sw_ms) > SW_DEBOUNCE_MS) {
-    g.last_sw_r = g.pending_sw_r;
-    g.armed = false;
-    g.reset_done = false;
-    g.dev_ms = now;
-    g.dev_a = 0.0f;
-    g.dev_b = 0.0f;
-    g.leader = 0;
-    pid_a.clear();
-    pid_b.clear();
-  }
-
-  const bool cboard_still = (fabsf(dyaw) < CBOARD_STILL);
-  // 比例用消抖后的档位
-  float k = left_ratio(g.last_sw_l);
-
-  // 下档：失能，发 0 电流
-  if (g.last_sw_r == sp::DBusSwitchMode::DOWN) {
-    motorA.cmd(0.0f);
-    motorB.cmd(0.0f);
-    linkage_ref_a = g.ref_a;
-    linkage_ref_b = g.ref_b;
-    linkage_phi_c = 0.0f;
+  // ---- M2 阶段(CHASSIS_MOTION_ENABLE = false)到此为止: 永远失能, 不做任何运动 ----
+  // ---- M3 阶段改成 true 后: 中档可动, 上档暂未定义(只发 0) ----
+  if (!CHASSIS_MOTION_ENABLE || remote.sw_r != sp::DBusSwitchMode::MID) {
+    disable_all();
     return;
   }
 
-  // 上档：复位。两台电机按 1:1 转到和 C 板当前指向一致的位置，三个箭头重新指同一个方向
-  if (g.last_sw_r == sp::DBusSwitchMode::UP) {
-    const float reset_phi_c = mech_yaw - g.psi0_mech;
-    const float target_a = g.a0 + A_DIR * reset_phi_c;
-    const float target_b = g.b0 + B_DIR * reset_phi_c;
+  // ---- 摇杆 → 车体目标速度(死区 → 方向标定 → 限幅) ----
+  const float vx_in = FWD_DIR * stick(remote.ch_lv, STICK_DEADZONE) * V_MAX;
+  const float vy_in = SIDE_DIR * stick(remote.ch_lh, STICK_DEADZONE) * V_MAX;
+  const float wz_in = ROT_DIR * stick(remote.ch_lu, STICK_DEADZONE) * WZ_MAX;
 
-    g.ref_a = slew(g.ref_a, target_a, REF_RATE * PID_DT);
-    g.ref_b = slew(g.ref_b, target_b, REF_RATE * PID_DT);
+  // 目标速度斜坡: 抑制阶跃冲击、减小振荡, 并让每次恢复运动都是平滑起步
+  vx_ramp = slew(vx_ramp, vx_in, V_SLEW, SPD_DT);
+  vy_ramp = slew(vy_ramp, vy_in, V_SLEW, SPD_DT);
+  wz_ramp = slew(wz_ramp, wz_in, W_SLEW, SPD_DT);
 
-    pid_a.calc(g.ref_a, motorA.angle);
-    pid_b.calc(g.ref_b, motorB.angle);
-    motorA.cmd(pid_a.out);
-    motorB.cmd(pid_b.out);
+  float wz = wz_ramp;
 
-    // 只锁一次：到位后把当前位置和朝向定成新的零位
-    if (!g.reset_done && fabsf(motorA.angle - target_a) < HOME_TOL &&
-        fabsf(motorB.angle - target_b) < HOME_TOL) {
-      g.reset_done = true;
-      g.a0 = motorA.angle;
-      g.b0 = motorB.angle;
-      g.b_ref0 = motorB.angle;
-      g.psi0_mech = mech_yaw;
-      g.ref_a = motorA.angle;
-      g.ref_b = motorB.angle;
+  // 直线偏航锁定(可选): 只推前后、没有横移和旋转时, 用偏航闭环把方向拽回锁存零点。
+  // 偏差用 limit_angle 处理 ±π 跳变; 修正量限幅, 不允许盖过手动指令。
+  if (
+    STRAIGHT_LOCK_ENABLE && fabsf(remote.ch_lh) < STRAIGHT_EPS &&
+    fabsf(remote.ch_lu) < STRAIGHT_EPS) {
+    if (!yaw_lock_active) {
+      yaw_set = imu.yaw;  // 进入直线状态, 锁存当前偏航为零点
+      yaw_lock_active = true;
     }
-
-    linkage_ref_a = g.ref_a;
-    linkage_ref_b = g.ref_b;
-    linkage_phi_c = 0.0f;
-    return;
+    const float yaw_err = sp::limit_angle(yaw_set - imu.yaw);
+    const float corr = YAW_SIGN * (YAW_KP * yaw_err - YAW_KD * imu.vyaw);
+    wz += sp::limit_max(corr, YAW_MAX);
+  }
+  else {
+    yaw_lock_active = false;
   }
 
-  // 中档：姿态与电机联动
-  if (!g.armed) {
-    // 刚切进来，以 A 的当前位置为起点
-    g.armed = true;
-    g.psi0_mech = mech_yaw - phi_A();
-    g.ref_a = motorA.angle;
-    g.ref_b = motorB.angle;
-    g.dev_ms = now;
-    g.dev_a = 0.0f;
-    g.dev_b = 0.0f;
-    g.leader = 0;
-    // 进中档时对齐左拨杆，并把 B 的基准钉在当前角度上
-    g.last_sw_l = remote.sw_l;
-    g.pending_sw_l = remote.sw_l;
-    g.sw_l_ms = now;
-    g.b_ref0 = motorB.angle - B_DIR * (left_ratio(g.last_sw_l) * (mech_yaw - g.psi0_mech));
-  }
+  mec.calc(vx_ramp, vy_ramp, wz);  // → 四轮目标转速 rad/s
 
-  // 左拨杆换档：k 变了要重钉 B 的基准，否则目标会随 k*phi_c 跳一次
-  if (remote.sw_l != g.pending_sw_l) {
-    g.pending_sw_l = remote.sw_l;
-    g.sw_l_ms = now;
-  } else if (g.pending_sw_l != g.last_sw_l && (now - g.sw_l_ms) > SW_DEBOUNCE_MS) {
-    g.last_sw_l = g.pending_sw_l;
-    k = left_ratio(g.last_sw_l);
-    const float phi_c_now = mech_yaw - g.psi0_mech;
-    g.b_ref0 = motorB.angle - B_DIR * (k * phi_c_now);
-    g.ref_b = motorB.angle;
-  }
-  linkage_k = k;
+  spd_lf.calc(mec.speed_lf, wheel_lf.speed);
+  spd_rf.calc(mec.speed_rf, wheel_rf.speed);
+  spd_lr.calc(mec.speed_lr, wheel_lr.speed);
+  spd_rr.calc(mec.speed_rr, wheel_rr.speed);
 
-  // 拖动检测：只有 C 板基本没动的时候，电机的偏差才认为是手拖出来的。
-  // C 板自己在转的时候电机也会滞后，那种偏差不能当成拖动。
-  // 另外偏差要持续不收敛才算手拖，正常追指令时偏差很快收敛。
-  if (cboard_still) {
-    float phi_c = mech_yaw - g.psi0_mech;
-    const float dev_a = fabsf(g.a0 + A_DIR * phi_c - motorA.angle);
-    const float dev_b = fabsf(g.b_ref0 + B_DIR * k * phi_c - motorB.angle);
+  // 功率限流(4.4.2.3): 超限时四轮转矩等比缩小
+  k_power = power_scale(
+    spd_lf.out, wheel_lf.speed, spd_rf.out, wheel_rf.speed, spd_lr.out, wheel_lr.speed, spd_rr.out,
+    wheel_rr.speed);
+  wheel_lf.cmd(k_power * spd_lf.out);
+  wheel_rf.cmd(k_power * spd_rf.out);
+  wheel_lr.cmd(k_power * spd_lr.out);
+  wheel_rr.cmd(k_power * spd_rr.out);
 
-    // 偏差在收敛，重新计时
-    if (dev_a < g.dev_a - DRAG_DECAY || dev_b < g.dev_b - DRAG_DECAY) {
-      g.dev_ms = now;
-    }
-    g.dev_a = dev_a;
-    g.dev_b = dev_b;
+  // 车体速度反解(验收要展示"车体速度"; 也是直线行驶偏航漂移/速度不一致的客观证据)
+  // ⚠️ 形参顺序是 (lf, lr, rf, rr) —— lr 在 rf 前面, 别按 lf/rf/lr/rr 写
+  mec.update(wheel_lf.speed, wheel_lr.speed, wheel_rf.speed, wheel_rr.speed);
 
-    if (now - g.dev_ms > DRAG_CONFIRM_MS) {
-      // 一次只认一台被拖动的电机，认住之后 DRAG_HOLD_MS 内不换人
-      if (g.leader != 0) {
-        const float dev_leader = (g.leader == 1) ? dev_a : dev_b;
-        if ((now - g.leader_ms) > DRAG_HOLD_MS && dev_leader < DRAG_TOL) {
-          g.leader = 0;
-        }
-      } else if (dev_a > DRAG_TOL) {
-        g.leader = 1;
-        g.leader_ms = now;
-      } else if (dev_b > DRAG_TOL) {
-        g.leader = 2;
-        g.leader_ms = now;
-      }
-
-      bool fired = false;
-      if (g.leader == 1 && dev_a > DRAG_TOL) {
-        // A 被拖动：参考零点跟着 A 走
-        g.psi0_mech = mech_yaw - phi_A();
-        g.ref_a = motorA.angle;
-        phi_c = mech_yaw - g.psi0_mech;
-        g.leader_ms = now;
-        fired = true;
-      } else if (g.leader == 2 && dev_b > DRAG_TOL) {
-        // B 被拖动：反过来由 B 推零点
-        g.psi0_mech = mech_yaw - phi_B() / k;
-        g.ref_b = motorB.angle;
-        g.leader_ms = now;
-        fired = true;
-      }
-
-      if (fired) {
-        g.dev_ms = now;
-        g.dev_a = 0.0f;
-        g.dev_b = 0.0f;
-      }
-    }
-  }
-
-  const float phi_c = mech_yaw - g.psi0_mech;
-
-  g.ref_a = slew(g.ref_a, g.a0 + A_DIR * phi_c, REF_RATE * PID_DT);
-  g.ref_b = slew(g.ref_b, g.b_ref0 + B_DIR * (k * phi_c), REF_RATE * PID_DT);
-
-  pid_a.calc(g.ref_a, motorA.angle);
-  pid_b.calc(g.ref_b, motorB.angle);
-  motorA.cmd(pid_a.out);
-  motorB.cmd(pid_b.out);
-
-  linkage_ref_a = g.ref_a;
-  linkage_ref_b = g.ref_b;
-  linkage_phi_c = phi_c;
+  plot_ch[0] = mec.speed_lf;          // 目标轮速(左前) rad/s
+  plot_ch[1] = wheel_lf.speed;        // 实际轮速(左前) rad/s
+  plot_ch[2] = k_power * spd_lf.out;  // 控制量(轮侧转矩) N·m
+  plot_ch[3] = wheel_rf.speed;        // 实际轮速(右前) rad/s
+  plot_ch[4] = wheel_lr.speed;        // 实际轮速(左后) rad/s
+  plot_ch[5] = wheel_rr.speed;        // 实际轮速(右后) rad/s
+  plot_ch[6] = imu.yaw;               // 偏航 rad
+  plot_ch[7] = p_pred;                // 预测功率 W
+  plot_ch[8] = pm_power;              // 功率计实测 W
+  plot_ch[9] = mec.vx;                // 车体实测 vx m/s (前进为正)
+  plot_ch[10] = mec.vy;               // 车体实测 vy m/s (左移为正)
+  plot_ch[11] = mec.wz;               // 车体实测 wz rad/s (逆时针为正)
 }
 }  // namespace
 
 extern "C" void can_task()
 {
-  osDelay(500);  // 等电机上电稳定
+  osDelay(500);  // 等电调上电稳定
 
   can1.config();
   can1.start();
+  can2.config();
+  can2.start();
 
   while (true) {
-    linkage_step();
+    chassis_step();
 
-    // 两台电机的控制帧 ID 一样，合成一帧只发一次
-    if (motorA.tx_id == motorB.tx_id) {
-      motorA.write(can1.tx_data);
-      motorB.write(can1.tx_data);
-      can1.send(motorA.tx_id);
-    }
-    else {
-      motorA.write(can1.tx_data);
-      can1.send(motorA.tx_id);
-      motorB.write(can1.tx_data);
-      can1.send(motorB.tx_id);
-    }
+    // 四台电机控制帧 ID 都是 0x200, 合成一帧只发一次
+    wheel_lf.write(mcan.tx_data);
+    wheel_rf.write(mcan.tx_data);
+    wheel_lr.write(mcan.tx_data);
+    wheel_rr.write(mcan.tx_data);
+    mcan.send(wheel_lf.tx_id);
 
-    osDelay(1);
+    osDelay(1);  // 1ms 控制周期
+  }
+}
+
+// 四个电机反馈帧(0x201~0x204)分发; d = 刚 recv() 出来的 mcan.rx_data
+static void dispatch_motors(uint8_t * d, uint32_t stamp_ms)
+{
+  const uint32_t id = mcan.rx_id;
+  if (id == wheel_lf.rx_id) {
+    wheel_lf.read(d, stamp_ms);
+  }
+  else if (id == wheel_rf.rx_id) {
+    wheel_rf.read(d, stamp_ms);
+  }
+  else if (id == wheel_lr.rx_id) {
+    wheel_lr.read(d, stamp_ms);
+  }
+  else if (id == wheel_rr.rx_id) {
+    wheel_rr.read(d, stamp_ms);
   }
 }
 
 extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef * hcan)
 {
-  auto stamp_ms = osKernelSysTick();
+  const uint32_t stamp_ms = osKernelSysTick();
 
   while (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0) > 0) {
     if (hcan == &hcan1) {
       can1.recv();
-
-      if (can1.rx_id == motorA.rx_id)
-        motorA.read(can1.rx_data, stamp_ms);
-      else if (can1.rx_id == motorB.rx_id)
-        motorB.read(can1.rx_data, stamp_ms);
+      if (can1.rx_id == 0x301) {
+        parse_power(can1.rx_data);  // 功率计(标准帧), 接哪条都能收
+      }
+      else if (MOTORS_ON_CAN1) {
+        dispatch_motors(can1.rx_data, stamp_ms);
+      }
+    }
+    else if (hcan == &hcan2) {
+      can2.recv();
+      if (can2.rx_id == 0x301) {
+        parse_power(can2.rx_data);
+      }
+      else if (!MOTORS_ON_CAN1) {
+        dispatch_motors(can2.rx_data, stamp_ms);
+      }
     }
   }
 }
