@@ -38,7 +38,7 @@ constexpr bool CHASSIS_MOTION_ENABLE = true;
 
 // ===== 电调 ID 自检模式: true = 只报 4 个 CAN ID 有没有反馈, 禁止一切运动 =====
 // 用法: 改成 true 烧录 → SerialPlot 看通道 0/1/2/3 = 左前/右前/左后/右后是否在线(1=在线, 0=不在线)。
-// 用途: 确认 C620 的 ID 到底设成了几号(见 指导文档\第二阶段-电调ID设置与确认.md)。
+// 用途: 确认 C620 的 ID 到底设成了几号。
 // 自检做完必须改回 false, 否则底盘永远不会动。
 constexpr bool ID_CHECK_MODE = false;
 

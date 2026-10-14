@@ -14,6 +14,7 @@
 //   7 模型预测功率 W                       ← 功率控制(4.4.2.3)
 //   8 功率计实测功率 W                     ← 验收要求"预测 vs 实际"
 //   9/10/11 车体实测 vx/vy/wz              ← 验收要求"车体速度"; 直线行驶看 wz 是否≈0
+// (红外测距/云台姿态等通道在**云台 C 板**工程 ..\files\stage_2_gimbal 的 plotter 里，本板不混用)
 extern float plot_ch[12];  // 定义在 applications/can_task.cpp
 
 sp::Plotter plotter(&huart1);
@@ -21,9 +22,16 @@ sp::Plotter plotter(&huart1);
 extern "C" void plotter_task()
 {
   while (true) {
-    plotter.plot(
-      plot_ch[0], plot_ch[1], plot_ch[2], plot_ch[3], plot_ch[4], plot_ch[5], plot_ch[6], plot_ch[7],
-      plot_ch[8], plot_ch[9], plot_ch[10], plot_ch[11]);
+    // ⚠️ 必须确认上一帧已经发完(UART 回到 READY)再填下一帧:
+    // Plotter 内部只有一份 plot_frame_ 缓冲, 而发送走 DMA —— 在 DMA 还在读这块内存时改写,
+    // SerialPlot 上就会出现错位帧/花帧(库里的 send() 只是把 BUSY 记进 hal_status_, 那时缓冲已经被改坏了)。
+    // huart1.gState 由 HAL 在 DMA 发送完成中断里恢复成 HAL_UART_STATE_READY。
+    // 一帧 = 51 B @921600 ≈ 0.55 ms, 正常 1 ms 周期够用; 万一上一帧还没发完, 本帧直接丢弃(不补发)。
+    if (huart1.gState == HAL_UART_STATE_READY) {
+      plotter.plot(
+        plot_ch[0], plot_ch[1], plot_ch[2], plot_ch[3], plot_ch[4], plot_ch[5], plot_ch[6],
+        plot_ch[7], plot_ch[8], plot_ch[9], plot_ch[10], plot_ch[11]);
+    }
     osDelay(1);
   }
 }
