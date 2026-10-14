@@ -64,7 +64,7 @@ constexpr float WZ_MAX = 1.0f;  // 旋转角速度上限 rad/s (规则书: 拨�
 constexpr float STICK_DEADZONE = 0.02f;
 
 // ---- 目标速度斜坡(4.4.2.2 "直线行驶时应尽量减小偏航、振荡"; 同时充当软启动) ----
-constexpr float V_SLEW = 0.8f;  // 车体线速度变化率上限 m/s² (0 → 1m/s 约 0.33s)
+constexpr float V_SLEW = 0.8f;  // 车体线速度变化率上限 m/s² (0 → 1m/s 约 1.25s; 2026-10-14 由 3.0 降下来)
 constexpr float W_SLEW = 4.0f;  // 角速度变化率上限 rad/s²
 
 // ---- 方向标定(试车发现反了就把对应项改 -1, 不要动机械) ----
