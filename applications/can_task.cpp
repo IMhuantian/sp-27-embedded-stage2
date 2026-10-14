@@ -64,7 +64,7 @@ constexpr float WZ_MAX = 1.0f;  // 旋转角速度上限 rad/s (规则书: 拨�
 constexpr float STICK_DEADZONE = 0.02f;
 
 // ---- 目标速度斜坡(4.4.2.2 "直线行驶时应尽量减小偏航、振荡"; 同时充当软启动) ----
-constexpr float V_SLEW = 3.0f;  // 车体线速度变化率上限 m/s² (0 → 1m/s 约 0.33s)
+constexpr float V_SLEW = 0.8f;  // 车体线速度变化率上限 m/s² (0 → 1m/s 约 0.33s)
 constexpr float W_SLEW = 4.0f;  // 角速度变化率上限 rad/s²
 
 // ---- 方向标定(试车发现反了就把对应项改 -1, 不要动机械) ----
@@ -77,13 +77,13 @@ constexpr float SIDE_DIR = -1.0f;  // ch_lh 右推(+) 要得到"右移", 而 vy 
 constexpr float ROT_DIR = +1.0f;   // ch_lu 左推(+) = 左转, 而 wz 正方向就是逆时针(左转) → 取正
 
 // ---- 每轮速度环, 输出 = 轮侧转矩 N·m ----
-constexpr float SPD_DT = 1e-3f;      // 与控制周期 osDelay(1) 一致
-constexpr float SPD_KP = 1.0f;       // 整定起点, 见指南 M4
-constexpr float SPD_KI = 0.2f;
+constexpr float SPD_DT = 1e-3f;  // 与控制周期 osDelay(1) 一致
+constexpr float SPD_KP = 0.9f;   // 整定起点, 见指南 M4
+constexpr float SPD_KI = 0.02f;
 constexpr float SPD_KD = 0.0f;
-constexpr float SPD_MAX_OUT = 1.0f;  // 单轮转矩限幅 N·m (总输出限幅), 首测 1.0, 稳定后放 3.0
-constexpr float SPD_MAX_IOUT = 0.5f; // 积分分项限幅(防积分饱和)
-constexpr float SPD_ALPHA = 0.8f;    // 反馈低通
+constexpr float SPD_MAX_OUT = 1.0f;   // 单轮转矩限幅 N·m (总输出限幅), 首测 1.0, 稳定后放 3.0
+constexpr float SPD_MAX_IOUT = 0.5f;  // 积分分项限幅(防积分饱和)
+constexpr float SPD_ALPHA = 0.0f;     // 反馈低通
 
 // ---- M4: 直线行驶的偏航锁定(可选). 建议先用 false 把基本运动跑通, 再开来对比效果 ----
 constexpr bool STRAIGHT_LOCK_ENABLE = false;
