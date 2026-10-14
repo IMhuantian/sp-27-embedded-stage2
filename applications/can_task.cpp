@@ -37,7 +37,7 @@ namespace
 constexpr bool CHASSIS_MOTION_ENABLE = true;
 
 // ===== 电调 ID 自检模式: true = 只报 4 个 CAN ID 有没有反馈, 禁止一切运动 =====
-// 用法: 改成 true 烧录 → SerialPlot 看通道 0/1/2/3 = ID 1/2/3/4 是否在线(1=在线, 0=不在线)。
+// 用法: 改成 true 烧录 → SerialPlot 看通道 0/1/2/3 = 左前/右前/左后/右后是否在线(1=在线, 0=不在线)。
 // 用途: 确认 C620 的 ID 到底设成了几号(见 指导文档\第二阶段-电调ID设置与确认.md)。
 // 自检做完必须改回 false, 否则底盘永远不会动。
 constexpr bool ID_CHECK_MODE = false;
@@ -120,10 +120,11 @@ sp::CAN & ocan = MOTORS_ON_CAN1 ? can2 : can1;  // 另一条: 只收 0x301(功�
 
 // 第三个参数 = 减速比, 必须显式传 GEAR_RATIO:
 // 默认值 1.0f 会让 speed/torque 变成"电机侧"量纲, 且 cmd() 的量程会差一个减速比。
-sp::RM_Motor wheel_lf(1, sp::RM_Motors::M3508, GEAR_RATIO);
-sp::RM_Motor wheel_rf(2, sp::RM_Motors::M3508, GEAR_RATIO);
-sp::RM_Motor wheel_lr(3, sp::RM_Motors::M3508, GEAR_RATIO);
-sp::RM_Motor wheel_rr(4, sp::RM_Motors::M3508, GEAR_RATIO);
+// 2026-10-14: 用户按 C620 绿灯闪烁次数确认实物位置。
+sp::RM_Motor wheel_lf(4, sp::RM_Motors::M3508, GEAR_RATIO);
+sp::RM_Motor wheel_rf(3, sp::RM_Motors::M3508, GEAR_RATIO);
+sp::RM_Motor wheel_lr(1, sp::RM_Motors::M3508, GEAR_RATIO);
+sp::RM_Motor wheel_rr(2, sp::RM_Motors::M3508, GEAR_RATIO);
 
 // 默认右轮按"反装"解算(reverse_rf/rr = true), 试车发现某轮转向不对就把对应 bool 翻过来
 sp::Mecanum mec(WHEEL_R, HALF_L, HALF_W);
@@ -242,10 +243,10 @@ void chassis_step()
   if (ID_CHECK_MODE) {
     disable_all();
     const bool t = (now >= 2000u);                         // 上电 2s 后再判定(之前一律 0)
-    plot_ch[0] = (t && wheel_lf.is_open()) ? 1.0f : 0.0f;  // CAN ID 1 (左前)
-    plot_ch[1] = (t && wheel_rf.is_open()) ? 1.0f : 0.0f;  // CAN ID 2 (右前)
-    plot_ch[2] = (t && wheel_lr.is_open()) ? 1.0f : 0.0f;  // CAN ID 3 (左后)
-    plot_ch[3] = (t && wheel_rr.is_open()) ? 1.0f : 0.0f;  // CAN ID 4 (右后)
+    plot_ch[0] = (t && wheel_lf.is_open()) ? 1.0f : 0.0f;  // CAN ID 4 (左前)
+    plot_ch[1] = (t && wheel_rf.is_open()) ? 1.0f : 0.0f;  // CAN ID 3 (右前)
+    plot_ch[2] = (t && wheel_lr.is_open()) ? 1.0f : 0.0f;  // CAN ID 1 (左后)
+    plot_ch[3] = (t && wheel_rr.is_open()) ? 1.0f : 0.0f;  // CAN ID 2 (右后)
     return;
   }
 

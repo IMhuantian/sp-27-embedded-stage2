@@ -16,7 +16,7 @@
 			],
 			"group": {
 				"kind": "build",
-				"isDefault": true
+				"isDefault": false
 			},
 			"dependsOn": "CMake: build",
 			"detail": "Download program into STM32"
@@ -29,7 +29,10 @@
 				"all"
 			],
 			"preset": "${command:cmake.activeBuildPresetName}",
-			"group": "build",
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
 			"problemMatcher": [],
 			"detail": "CMake template build task"
 		}

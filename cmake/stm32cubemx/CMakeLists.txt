@@ -112,9 +112,12 @@ set(FreeRTOS_Src
 
 # Link directories setup
 set(MX_LINK_DIRS
-
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../Middlewares/ST/ARM/DSP/Lib
 )
+# Keep the DSP search path relative to the linker working directory.
+# Windows GNU ld cannot read the Chinese absolute path in Ninja response files.
+file(RELATIVE_PATH DSP_LIB_RELATIVE_DIR "${CMAKE_BINARY_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../Middlewares/ST/ARM/DSP/Lib")
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE "-L${DSP_LIB_RELATIVE_DIR}")
 # Project static libraries
 set(MX_LINK_LIBS 
  "-Wl,--start-group" 
