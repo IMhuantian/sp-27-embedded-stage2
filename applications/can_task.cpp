@@ -64,7 +64,8 @@ constexpr float WZ_MAX = 1.0f;  // 旋转角速度上限 rad/s (规则书: 拨�
 constexpr float STICK_DEADZONE = 0.02f;
 
 // ---- 目标速度斜坡(4.4.2.2 "直线行驶时应尽量减小偏航、振荡"; 同时充当软启动) ----
-constexpr float V_SLEW = 0.8f;  // 车体线速度变化率上限 m/s² (0 → 1m/s 约 1.25s; 2026-10-14 由 3.0 降下来)
+constexpr float V_SLEW =
+  0.8f;  // 车体线速度变化率上限 m/s² (0 → 1m/s 约 1.25s; 2026-10-14 由 3.0 降下来)
 constexpr float W_SLEW = 4.0f;  // 角速度变化率上限 rad/s²
 
 // ---- 方向标定(试车发现反了就把对应项改 -1, 不要动机械) ----
@@ -117,9 +118,9 @@ constexpr float POWER_TARGET_W = POWER_LIMIT_W - POWER_MARGIN_W;  // 实际限�
 // 裁判系统上限功率 − (2,5)W(取决于要激进还是保守)」。余量用来吸收模型误差 + 功率计采样
 // 延迟, 避免瞬时超调撞上裁判系统的硬断电。
 
-constexpr float K1 = 2.0f;   // Στ² 系数(轮侧口径初值, 参考资料的"经验"值)
+constexpr float K1 = 1.8f;   // Στ² 系数(轮侧口径初值, 参考资料的"经验"值)
 constexpr float K2 = 0.01f;  // Σω² 系数(轮侧口径初值)
-constexpr float K3 = 2.0f;   // 静态功耗 W(底盘静止时实测整定)
+constexpr float K3 = 4.2f;   // 静态功耗 W(底盘静止时实测整定)
 // 注: 《RM 电源模块 PM02 使用说明书》的"静态空载功耗 2.2 W"是电源模块自己的耗电, 不在
 //     底盘通道的测量口径里, 不能直接拿来当 K3。
 
@@ -136,6 +137,25 @@ constexpr uint32_t PM_DATA_TIMEOUT_MS = 100u;
 constexpr float PM_POWER_FILTER_ALPHA = 0.2f;     // 实测功率低通(1ms 周期 → 时间常数约 5ms)
 constexpr float PM_CURRENT_CONT_LIMIT_A = 10.0f;  // 底盘通道持续电流上限(手册)
 constexpr float POWER_FEEDBACK_MIN_K = 0.2f;      // 兜底也不把转矩压到 0(避免突然失去动力)
+
+// ---- 功率整定视图(默认关) ----
+// 打开后 12 个 plot 通道换成"模型分项 + 测量值", 用来判断预测偏高/偏低到底出在哪一项
+// (此时通道含义与文档里的默认表不同, 整定完记得关掉):
+//   ch0 = Σ(τ·ω) 机械功率 W    ch1 = K1·Στ² 铜损项 W   ch2 = K2·Σω² 铁损项 W   ch3 = K3 W
+//   ch4 = p_pred 合计预测 W    ch5 = pm_power 实测 W    ch6 = pm_current 实测电流 A
+//   ch7..ch10 = 四轮指令转矩 N·m(lf/rf/lr/rr)          ch11 = mec.vx m/s
+constexpr bool POWER_TUNE_PLOT = false;
+
+// ---- 自动行驶: 右拨杆上档 → 前进固定距离后自动停车 ----
+// 拨杆语义(改后): 中档 = 手动遥控(摇杆); 上档 = 自动行驶 AUTO_DISTANCE_M 米; 下档 = 全部失能(不变)。
+// 只在 CHASSIS_MOTION_ENABLE = true 且三层失能全部正常时才动作; 任何失能条件成立就放弃本次行驶。
+// 距离是闭环的: 边走边用实测车体速度 vx 积分, 走到 AUTO_DISTANCE_M 就停, 不是"发够时间"。
+constexpr bool AUTO_DRIVE_ENABLE = true;      // 不需要这个功能时置 false(上档回到"只发 0")
+constexpr float AUTO_DISTANCE_M = 3.3f;       // 要走的距离 m(沿车体前进方向)
+constexpr float AUTO_SPEED_MPS = 0.6f;        // 巡航速度 m/s (≤ V_MAX)
+constexpr float AUTO_ACCEL_MPS2 = V_SLEW;     // 加减速上限, 与手动斜坡同一个值(0.8 m/s²)
+constexpr float AUTO_STOP_TOL_M = 0.03f;      // 剩余距离小于它就判到位(3 cm)
+constexpr uint32_t AUTO_TIMEOUT_MS = 15000u;  // 超时保护: 被卡住/空转打滑时也会停
 }  // namespace
 
 // ---- 底盘 4×C620 接在哪条 CAN 上（**接线必须与这里一致**）----
@@ -170,13 +190,16 @@ extern sp::DBus remote;  // applications/uart_task.cpp
 extern sp::Mahony imu;   // applications/imu_task.cpp
 
 // 功率计(0x301): data[0..1]=电流×100, [2..3]=电压×100, [4..5]=功率×100, [6..7]=0
-float pm_current = 0.0f;  // A
-float pm_voltage = 0.0f;  // V
-float pm_power = 0.0f;    // W
+float pm_current = 0.0f;   // A
+float pm_voltage = 0.0f;   // V
+float pm_power = 0.0f;     // W
 uint32_t pm_stamp_ms = 0;  // 最近一次收到 0x301 的时刻(0 = 上电后还没收到过)
 float pm_power_f = 0.0f;   // 实测功率低通值 W(只给第二轮兜底用)
-float p_pred = 0.0f;      // 模型预测功率 W
-float k_power = 1.0f;     // 当前功率限流系数(模型限流 × 实测兜底)
+float p_pred = 0.0f;
+float p_tw = 0.0f;     // 分项: Σ(τ·ω) 机械功率 W(整定视图用)
+float p_t1 = 0.0f;     // 分项: K1·Στ² W
+float p_t2 = 0.0f;     // 分项: K2·Σω² W       // 模型预测功率 W
+float k_power = 1.0f;  // 当前功率限流系数(模型限流 × 实测兜底)
 
 // 目标速度斜坡状态(失能时清零 → 每次恢复运动都从 0 平滑起步, 不会突然窜出去)
 float vx_ramp = 0.0f;
@@ -192,6 +215,18 @@ float plot_ch[12] = {0};
 // 直线偏航锁定状态
 bool yaw_lock_active = false;
 float yaw_set = 0.0f;
+
+// 自动行驶状态(右拨杆上档触发; 距离/速度见 AUTO_* 常量)
+enum class AutoState : uint8_t
+{
+  IDLE,  // 未启动(拨杆不在上档)
+  RUN,   // 自动行驶中
+  STOP   // 本次已结束(到位 / 超时 / 中途失能): 拨杆离开上档后才复位
+};
+AutoState auto_state = AutoState::IDLE;
+float auto_dist = 0.0f;      // 本次已行驶距离 m(实测 vx 积分)
+uint32_t auto_stamp_ms = 0;  // 本次启动时刻(超时保护用)
+uint32_t auto_last_ms = 0;   // 上一周期时刻(积分用实际步长)
 
 namespace
 {
@@ -213,6 +248,14 @@ void disable_all()
   vx_ramp = 0.0f;           // 斜坡状态清零: 下次恢复运动从 0 起步(软启动)
   vy_ramp = 0.0f;
   wz_ramp = 0.0f;
+  // 失去使能就放弃本次自动行驶: 置 STOP 而不是 IDLE —— 拨杆还停在上档时不允许自己重新起步,
+  // 必须先把拨杆掰离上档、再切回上档, 才算"重新下一次命令"。
+  if (auto_state == AutoState::RUN) {
+    auto_state = AutoState::STOP;
+  }
+  if (remote.sw_r != sp::DBusSwitchMode::UP) {
+    auto_state = AutoState::IDLE;  // 拨杆已经离开上档 → 直接复位, 下次切上来是全新一次
+  }
   // 让 SerialPlot 上直接看出"已失能": 目标/控制量归零(实际轮速仍显示真实值)
   plot_ch[0] = 0.0f;
   plot_ch[2] = 0.0f;
@@ -248,7 +291,7 @@ void parse_power(const uint8_t * d, uint32_t stamp_ms)
   pm_current = (float)(int16_t)((d[0] << 8) | d[1]) / 100.0f;   // A
   pm_voltage = (float)(uint16_t)((d[2] << 8) | d[3]) / 100.0f;  // V
   pm_power = (float)(uint16_t)((d[4] << 8) | d[5]) / 100.0f;    // W
-  pm_stamp_ms = stamp_ms;  // 记录新鲜度(中断里带进来的时间戳)
+  pm_stamp_ms = stamp_ms;                                       // 记录新鲜度(中断里带进来的时间戳)
 }
 
 // 预测功率超限时把 4 轮转矩等比缩小 K'。
@@ -261,6 +304,9 @@ float power_scale(float t1, float w1, float t2, float w2, float t3, float w3, fl
   const float sum_t2 = t1 * t1 + t2 * t2 + t3 * t3 + t4 * t4;
   const float sum_w2 = w1 * w1 + w2 * w2 + w3 * w3 + w4 * w4;
   p_pred = sum_tw + K1 * sum_t2 + K2 * sum_w2 + K3;
+  p_tw = sum_tw;                           // 整定视图分项
+  p_t1 = K1 * sum_t2;                      // 整定视图分项
+  p_t2 = K2 * sum_w2;                      // 整定视图分项
   if (POWER_LIMIT_UNLIMITED) return 1.0f;  // 规则参数设成 Unlimited: 不做功率限幅
   if (p_pred <= POWER_TARGET_W) return 1.0f;
 
@@ -307,17 +353,45 @@ void chassis_step()
     return;
   }
 
+  // ---- 运动使能: 中档 = 手动遥控; 上档 = 自动行驶(见 AUTO_* 常量); 其它 = 只发 0 ----
   // ---- M2 阶段(CHASSIS_MOTION_ENABLE = false)到此为止: 永远失能, 不做任何运动 ----
-  // ---- M3 阶段改成 true 后: 中档可动, 上档暂未定义(只发 0) ----
-  if (!CHASSIS_MOTION_ENABLE || remote.sw_r != sp::DBusSwitchMode::MID) {
+  const bool manual_mode = remote.sw_r == sp::DBusSwitchMode::MID;
+  const bool auto_mode = AUTO_DRIVE_ENABLE && remote.sw_r == sp::DBusSwitchMode::UP;
+
+  if (!CHASSIS_MOTION_ENABLE || (!manual_mode && !auto_mode)) {
     disable_all();
     return;
   }
 
-  // ---- 摇杆 → 车体目标速度(死区 → 方向标定 → 限幅) ----
-  const float vx_in = FWD_DIR * stick(remote.ch_lv, STICK_DEADZONE) * V_MAX;
-  const float vy_in = SIDE_DIR * stick(remote.ch_lh, STICK_DEADZONE) * V_MAX;
-  const float wz_in = ROT_DIR * stick(remote.ch_lu, STICK_DEADZONE) * WZ_MAX;
+  // ---- 自动行驶: 切到上档开始一次, 走到距离(或超时)就停 ----
+  float auto_v = 0.0f;
+  if (!auto_mode) {
+    auto_state = AutoState::IDLE;  // 离开上档 → 复位; 下次切上来才算新的一次
+  }
+  else if (auto_state == AutoState::IDLE) {
+    auto_state = AutoState::RUN;  // 刚切到上档: 开始本次自动行驶
+    auto_dist = 0.0f;
+    auto_stamp_ms = now;
+    auto_last_ms = now;
+  }
+  if (auto_state == AutoState::RUN) {
+    if (
+      (AUTO_DISTANCE_M - auto_dist) <= AUTO_STOP_TOL_M || (now - auto_stamp_ms) > AUTO_TIMEOUT_MS) {
+      auto_state = AutoState::STOP;  // 到位 / 超时: 目标速度回 0, 由同一个斜坡平滑刹停
+    }
+    else {
+      // 梯形曲线: 由剩余距离反算"还刹得住"的速度上限 v = sqrt(2·a·s), 再与巡航速度取小
+      const float remain = AUTO_DISTANCE_M - auto_dist;
+      const float v_brake = sqrtf(2.0f * AUTO_ACCEL_MPS2 * remain);
+      auto_v = (v_brake > AUTO_SPEED_MPS) ? AUTO_SPEED_MPS : v_brake;
+    }
+  }
+
+  // ---- 目标车体速度: 手动取摇杆(死区 → 方向标定 → 限幅); 自动只走前进方向 ----
+  const float vx_in =
+    manual_mode ? (FWD_DIR * stick(remote.ch_lv, STICK_DEADZONE) * V_MAX) : (FWD_DIR * auto_v);
+  const float vy_in = manual_mode ? (SIDE_DIR * stick(remote.ch_lh, STICK_DEADZONE) * V_MAX) : 0.0f;
+  const float wz_in = manual_mode ? (ROT_DIR * stick(remote.ch_lu, STICK_DEADZONE) * WZ_MAX) : 0.0f;
 
   // 目标速度斜坡: 抑制阶跃冲击、减小振荡, 并让每次恢复运动都是平滑起步
   vx_ramp = slew(vx_ramp, vx_in, V_SLEW, SPD_DT);
@@ -328,9 +402,10 @@ void chassis_step()
 
   // 直线偏航锁定(可选): 只推前后、没有横移和旋转时, 用偏航闭环把方向拽回锁存零点。
   // 偏差用 limit_angle 处理 ±π 跳变; 修正量限幅, 不允许盖过手动指令。
+  // 自动行驶期间也走这一支(横移/旋转指令恒为 0, 等于"在走直线"), 让偏航锁定帮着把车走直
   if (
-    STRAIGHT_LOCK_ENABLE && fabsf(remote.ch_lh) < STRAIGHT_EPS &&
-    fabsf(remote.ch_lu) < STRAIGHT_EPS) {
+    STRAIGHT_LOCK_ENABLE &&
+    (auto_mode || (fabsf(remote.ch_lh) < STRAIGHT_EPS && fabsf(remote.ch_lu) < STRAIGHT_EPS))) {
     if (!yaw_lock_active) {
       yaw_set = imu.yaw;  // 进入直线状态, 锁存当前偏航为零点
       yaw_lock_active = true;
@@ -379,18 +454,44 @@ void chassis_step()
   // ⚠️ 形参顺序是 (lf, lr, rf, rr) —— lr 在 rf 前面, 别按 lf/rf/lr/rr 写
   mec.update(wheel_lf.speed, wheel_lr.speed, wheel_rf.speed, wheel_rr.speed);
 
-  plot_ch[0] = mec.speed_lf;          // 目标轮速(左前) rad/s
-  plot_ch[1] = wheel_lf.speed;        // 实际轮速(左前) rad/s
-  plot_ch[2] = k_power * spd_lf.out;  // 控制量(轮侧转矩) N·m
-  plot_ch[3] = wheel_rf.speed;        // 实际轮速(右前) rad/s
-  plot_ch[4] = wheel_lr.speed;        // 实际轮速(左后) rad/s
-  plot_ch[5] = wheel_rr.speed;        // 实际轮速(右后) rad/s
-  plot_ch[6] = imu.yaw;               // 偏航 rad
-  plot_ch[7] = p_pred;                // 预测功率 W
-  plot_ch[8] = pm_power;              // 功率计实测 W
-  plot_ch[9] = mec.vx;                // 车体实测 vx m/s (前进为正)
-  plot_ch[10] = mec.vy;               // 车体实测 vy m/s (左移为正)
-  plot_ch[11] = mec.wz;               // 车体实测 wz rad/s (逆时针为正)
+  // 自动行驶里程: 用实测车体前进速度 × 实际步长积分(只在本次行驶期间累加, 平时推车不计数)。
+  // 步长取两次进入本函数的实测时间差, 不假设"周期一定是 1ms"; 异常值退回标称周期。
+  if (auto_state == AutoState::RUN) {
+    float dt = (float)(now - auto_last_ms) * 0.001f;
+    if (dt <= 0.0f || dt > 0.01f) dt = SPD_DT;
+    auto_dist += mec.vx * dt;
+  }
+  auto_last_ms = now;
+
+  if (POWER_TUNE_PLOT) {
+    // 功率整定视图: 通道含义见 POWER_TUNE_PLOT 的注释, 与默认表不同
+    plot_ch[0] = p_tw;         // Σ(τ·ω) 机械功率 W
+    plot_ch[1] = p_t1;         // K1·Στ² W
+    plot_ch[2] = p_t2;         // K2·Σω² W
+    plot_ch[3] = K3;           // K3 W
+    plot_ch[4] = p_pred;       // 合计预测 W
+    plot_ch[5] = pm_power;     // 功率计实测 W
+    plot_ch[6] = pm_current;   // 功率计实测电流 A
+    plot_ch[7] = spd_lf.out;   // 左前指令转矩 N·m
+    plot_ch[8] = spd_rf.out;   // 右前指令转矩 N·m
+    plot_ch[9] = spd_lr.out;   // 左后指令转矩 N·m
+    plot_ch[10] = spd_rr.out;  // 右后指令转矩 N·m
+    plot_ch[11] = mec.vx;      // 车体实测 vx m/s
+  }
+  else {
+    plot_ch[0] = mec.speed_lf;          // 目标轮速(左前) rad/s
+    plot_ch[1] = wheel_lf.speed;        // 实际轮速(左前) rad/s
+    plot_ch[2] = k_power * spd_lf.out;  // 控制量(轮侧转矩) N·m
+    plot_ch[3] = wheel_rf.speed;        // 实际轮速(右前) rad/s
+    plot_ch[4] = wheel_lr.speed;        // 实际轮速(左后) rad/s
+    plot_ch[5] = wheel_rr.speed;        // 实际轮速(右后) rad/s
+    plot_ch[6] = imu.yaw;               // 偏航 rad
+    plot_ch[7] = p_pred;                // 预测功率 W
+    plot_ch[8] = pm_power;              // 功率计实测 W
+    plot_ch[9] = mec.vx;                // 车体实测 vx m/s (前进为正)
+    plot_ch[10] = mec.vy;               // 车体实测 vy m/s (左移为正)
+    plot_ch[11] = mec.wz;               // 车体实测 wz rad/s (逆时针为正)
+  }
 }
 }  // namespace
 
