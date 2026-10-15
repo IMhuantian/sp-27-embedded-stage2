@@ -13,7 +13,7 @@
  *   右拨杆上档 → 本实现按失能处理(规则书未定义该档功能, 保守处理)
  *
  * 控制链: 摇杆死区 → 目标速度斜坡 → 麦克纳姆解算 → 每轮速度环 PID
- *         → 功率模型等比限流 → cmd(轮侧转矩 N·m)
+ *         → 功率模型等比限流(80W 档 − 3W 余量) → 实测功率/电流兜底 → cmd(轮侧转矩 N·m)
  *         同时用四轮实测转速反解车体速度(vx/vy/wz), 与目标/反馈/控制量一起送 SerialPlot。
  *
  * ⚠️ 用法: 先按 CHASSIS_MOTION_ENABLE = false 编译烧录做 M2(纯失能, 交指定人员检查),
@@ -97,13 +97,45 @@ constexpr float STRAIGHT_EPS = 0.10f;  // |ch_lh|、|ch_lu| 都小于它才算"�
 constexpr float YAW_SIGN = +1.0f;
 
 // ---- 功率模型(4.4.2.3, 整定见指南 M5) ----
-// K1/K2 必须与喂进来的 τ、ω 同口径: 本文件用的是轮侧 τ(N·m)、轮侧 ω(rad/s),
-// 与参考资料《底盘功率控制》的口径一致(主项 Στ·ω 与取哪一侧无关; 若哪天改用电机侧量纲,
-// 修正项系数要按 i² 重算: K1/i²、K2×i²)。下面只是参考初值, 必须按 M5 流程自己整定。
-constexpr float POWER_LIMIT_W = 60.0f;  // ⚠️ 占位! 实际上限值必须问导师
-constexpr float K1 = 2.0f;              // Στ² 系数(轮侧口径初值)
-constexpr float K2 = 0.01f;             // Σω² 系数(轮侧口径初值)
-constexpr float K3 = 2.0f;              // 静态功耗 W(静止实测整定)
+// 模型: P = Σ(τ·ω) + K1·Στ² + K2·Σω² + K3   (轮侧 τ / N·m、ω / rad/s 口径)
+// 出处: 参考资料《底盘功率控制》"一、功率预测模型"。K1/K2 必须与喂进来的 τ、ω 同口径,
+// 本文件用的是轮侧量纲(主项 Στ·ω 与取哪一侧无关); 若哪天改用电机侧量纲, 修正项系数要按
+// i² 重算: K1/i²、K2×i²。下面只是参考初值, 必须按 M5 流程自己整定。
+
+// ---- 功率上限(2026/10/15 按新到的手册改) ----
+// 《RM 2025 裁判系统 用户手册(中)V1.4》P19「规则参数设置」: 离线可把功率上限设成
+// 80 W / 120 W / Unlimited 三档; P11「机器人属性说明」写明「机器人底盘功率上限: 超过该
+// 限制及其能量时, 会对底盘进行断电」—— 超限不是扣分而是直接断电, 所以这里按保守档限流。
+// ⚠️ 正式比赛时这个值由服务器下发(还带"当前增益"), 而我们只解析 CAN 0x301 的电压/电流/
+//    功率, 读不到上限/缓冲能量/增益(那些在裁判系统用户串口协议里, 见该手册 P29 与
+//    《裁判系统串口协议说明》)。换档只改下面这一行; 将来若接上串口协议, 在这里改喂下发值。
+constexpr float POWER_LIMIT_W = 80.0f;         // ← 80 或 120(按本站规则选, 保守取 80)
+constexpr bool POWER_LIMIT_UNLIMITED = false;  // ← 规则参数设成 Unlimited 时才置 true
+constexpr float POWER_MARGIN_W = 3.0f;         // 限幅余量(出处见下)
+constexpr float POWER_TARGET_W = POWER_LIMIT_W - POWER_MARGIN_W;  // 实际限幅目标: 80-3 = 77 W
+// 余量出处: 参考资料《底盘功率控制》"三、调试"——「实际限幅时把输入函数的限制功率 =
+// 裁判系统上限功率 − (2,5)W(取决于要激进还是保守)」。余量用来吸收模型误差 + 功率计采样
+// 延迟, 避免瞬时超调撞上裁判系统的硬断电。
+
+constexpr float K1 = 2.0f;   // Στ² 系数(轮侧口径初值, 参考资料的"经验"值)
+constexpr float K2 = 0.01f;  // Σω² 系数(轮侧口径初值)
+constexpr float K3 = 2.0f;   // 静态功耗 W(底盘静止时实测整定)
+// 注: 《RM 电源模块 PM02 使用说明书》的"静态空载功耗 2.2 W"是电源模块自己的耗电, 不在
+//     底盘通道的测量口径里, 不能直接拿来当 K3。
+
+// ---- 第二轮限流: 实测反馈兜底 ----
+// 上面的功率模型是"前馈预测"; 真正决定裁判系统判罚与模块保护的是功率计实测值, 所以再加一层
+// 只用实测值的兜底(只减不增, 实测正常时恒为 1.0 → 行为与没有这一层时完全一致):
+//   1) 实测功率(低通后)超过 POWER_TARGET_W → 按 目标/实测 压转矩;
+//   2) 实测电流超过底盘通道持续电流上限 → 按 上限/实测 压转矩。
+// 电气依据《RM 电源模块 PM02 使用说明书》"产品参数": 底盘通道 10 A(最大持续负载)、
+// 30 A(输出持续时间小于 500 ms); 三通道合计 20 A(最大持续负载)。
+// 过期保护: 100 ms 没收到 0x301 就当没有功率计, 不会拿旧值一直限流。
+constexpr bool POWER_FEEDBACK_CLAMP_ENABLE = true;
+constexpr uint32_t PM_DATA_TIMEOUT_MS = 100u;
+constexpr float PM_POWER_FILTER_ALPHA = 0.2f;     // 实测功率低通(1ms 周期 → 时间常数约 5ms)
+constexpr float PM_CURRENT_CONT_LIMIT_A = 10.0f;  // 底盘通道持续电流上限(手册)
+constexpr float POWER_FEEDBACK_MIN_K = 0.2f;      // 兜底也不把转矩压到 0(避免突然失去动力)
 }  // namespace
 
 // ---- 底盘 4×C620 接在哪条 CAN 上（**接线必须与这里一致**）----
@@ -141,8 +173,10 @@ extern sp::Mahony imu;   // applications/imu_task.cpp
 float pm_current = 0.0f;  // A
 float pm_voltage = 0.0f;  // V
 float pm_power = 0.0f;    // W
+uint32_t pm_stamp_ms = 0;  // 最近一次收到 0x301 的时刻(0 = 上电后还没收到过)
+float pm_power_f = 0.0f;   // 实测功率低通值 W(只给第二轮兜底用)
 float p_pred = 0.0f;      // 模型预测功率 W
-float k_power = 1.0f;     // 当前功率限流系数
+float k_power = 1.0f;     // 当前功率限流系数(模型限流 × 实测兜底)
 
 // 目标速度斜坡状态(失能时清零 → 每次恢复运动都从 0 平滑起步, 不会突然窜出去)
 float vx_ramp = 0.0f;
@@ -174,6 +208,7 @@ void disable_all()
   spd_lr.clear();
   spd_rr.clear();
   k_power = 1.0f;
+  pm_power_f = 0.0f;        // 实测功率低通清零: 恢复运动时不带着旧的限流系数
   yaw_lock_active = false;  // 下次恢复运动时重新锁存偏航零点
   vx_ramp = 0.0f;           // 斜坡状态清零: 下次恢复运动从 0 起步(软启动)
   vy_ramp = 0.0f;
@@ -202,27 +237,36 @@ float slew(float now, float target, float rate, float dt)
   return target;
 }
 
-void parse_power(const uint8_t * d)
+// 功率计数据是否新鲜: 过期就当没有功率计, 第二轮兜底自动失效(不会拿旧值限流)
+bool pm_data_valid(uint32_t now)
+{
+  return pm_stamp_ms != 0u && (now - pm_stamp_ms) < PM_DATA_TIMEOUT_MS;
+}
+
+void parse_power(const uint8_t * d, uint32_t stamp_ms)
 {
   pm_current = (float)(int16_t)((d[0] << 8) | d[1]) / 100.0f;   // A
   pm_voltage = (float)(uint16_t)((d[2] << 8) | d[3]) / 100.0f;  // V
   pm_power = (float)(uint16_t)((d[4] << 8) | d[5]) / 100.0f;    // W
+  pm_stamp_ms = stamp_ms;  // 记录新鲜度(中断里带进来的时间戳)
 }
 
 // 预测功率超限时把 4 轮转矩等比缩小 K'。
-// P = Σ(τ·ω) + K1·Στ² + K2·Σω² + K3, 令 τ' = K'·τ 代入 P = Pmax:
-//   K1·Στ²·K'² + Σ(τ·ω)·K' + (K2·Σω² + K3 − Pmax) = 0, 取正根。
+// P = Σ(τ·ω) + K1·Στ² + K2·Σω² + K3, 令 τ' = K'·τ 代入 P = P_target:
+//   K1·Στ²·K'² + Σ(τ·ω)·K' + (K2·Σω² + K3 − P_target) = 0, 取正根。
+// P_target = POWER_LIMIT_W − POWER_MARGIN_W, 不是裁判系统的硬上限本身(留余量)。
 float power_scale(float t1, float w1, float t2, float w2, float t3, float w3, float t4, float w4)
 {
   const float sum_tw = t1 * w1 + t2 * w2 + t3 * w3 + t4 * w4;
   const float sum_t2 = t1 * t1 + t2 * t2 + t3 * t3 + t4 * t4;
   const float sum_w2 = w1 * w1 + w2 * w2 + w3 * w3 + w4 * w4;
   p_pred = sum_tw + K1 * sum_t2 + K2 * sum_w2 + K3;
-  if (p_pred <= POWER_LIMIT_W) return 1.0f;
+  if (POWER_LIMIT_UNLIMITED) return 1.0f;  // 规则参数设成 Unlimited: 不做功率限幅
+  if (p_pred <= POWER_TARGET_W) return 1.0f;
 
   const float a = K1 * sum_t2;
   const float b = sum_tw;
-  const float c = K2 * sum_w2 + K3 - POWER_LIMIT_W;
+  const float c = K2 * sum_w2 + K3 - POWER_TARGET_W;
   const float disc = b * b - 4.0f * a * c;
   // 兜底: 判别式<0 只可能发生在 c>0(即"零转矩下预测功率都已超限")——此时 K'∈[0,1] 内
   // 功率随 K' 单调上升, 最小值在 K'=0, 所以直接给 0 转矩最安全(而不是给一个固定系数)
@@ -251,6 +295,9 @@ void chassis_step()
   }
 
   // ---- 三层失能(最高优先级): 电机反馈中断 / 遥控器失联 / 右拨杆下档 ----
+  // 另: 裁判系统在"血量为零"或"底盘功率超限且缓冲能量耗尽"时会直接切断底盘通道供电
+  // (《RM 2025 裁判系统 用户手册》V1.4 P5 血量为零自动切断动力电源 / P11 功率上限),
+  // 那时电调反馈消失, 本层会接管失能 —— 不需要为断电再写一套逻辑。
   // is_alive() = 距上次收到该电机反馈 < 100ms(见 rm_motor.cpp:103), 比 is_open() 更严:
   // 运行中拔掉/压断某台 C620 的通信线, 会立刻整机进入失能(单轮速度环失去反馈会失控)。
   if (
@@ -307,6 +354,22 @@ void chassis_step()
   k_power = power_scale(
     spd_lf.out, wheel_lf.speed, spd_rf.out, wheel_rf.speed, spd_lr.out, wheel_lr.speed, spd_rr.out,
     wheel_rr.speed);
+
+  // 第二轮: 实测兜底(前馈模型之外的安全网, 只把 k_power 往小里乘)
+  if (POWER_FEEDBACK_CLAMP_ENABLE && pm_data_valid(now)) {
+    pm_power_f += PM_POWER_FILTER_ALPHA * (pm_power - pm_power_f);  // 低通, 抑制单帧噪声
+    float k_fb = 1.0f;
+    if (pm_power_f > POWER_TARGET_W) k_fb = POWER_TARGET_W / pm_power_f;
+    if (pm_current > PM_CURRENT_CONT_LIMIT_A) {
+      const float k_i = PM_CURRENT_CONT_LIMIT_A / pm_current;  // 模块底盘通道持续电流上限
+      if (k_i < k_fb) k_fb = k_i;
+    }
+    if (k_fb < POWER_FEEDBACK_MIN_K) k_fb = POWER_FEEDBACK_MIN_K;
+    k_power *= k_fb;
+  }
+  else {
+    pm_power_f = 0.0f;  // 没有功率计/数据过期: 不复用旧值
+  }
   wheel_lf.cmd(k_power * spd_lf.out);
   wheel_rf.cmd(k_power * spd_rf.out);
   wheel_lr.cmd(k_power * spd_lr.out);
@@ -380,7 +443,7 @@ extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef * hcan)
     if (hcan == &hcan1) {
       can1.recv();
       if (can1.rx_id == 0x301) {
-        parse_power(can1.rx_data);  // 功率计(标准帧), 接哪条都能收
+        parse_power(can1.rx_data, stamp_ms);  // 功率计(标准帧), 接哪条都能收
       }
       else if (MOTORS_ON_CAN1) {
         dispatch_motors(can1.rx_data, stamp_ms);
@@ -389,7 +452,7 @@ extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef * hcan)
     else if (hcan == &hcan2) {
       can2.recv();
       if (can2.rx_id == 0x301) {
-        parse_power(can2.rx_data);
+        parse_power(can2.rx_data, stamp_ms);
       }
       else if (!MOTORS_ON_CAN1) {
         dispatch_motors(can2.rx_data, stamp_ms);
