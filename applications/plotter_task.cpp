@@ -22,7 +22,7 @@ sp::Plotter plotter(&huart1);
 extern "C" void plotter_task()
 {
   while (true) {
-    // ⚠️ 必须确认上一帧已经发完(UART 回到 READY)再填下一帧:
+    //  必须确认上一帧已经发完(UART 回到 READY)再填下一帧:
     // Plotter 内部只有一份 plot_frame_ 缓冲, 而发送走 DMA —— 在 DMA 还在读这块内存时改写,
     // SerialPlot 上就会出现错位帧/花帧(库里的 send() 只是把 BUSY 记进 hal_status_, 那时缓冲已经被改坏了)。
     // huart1.gState 由 HAL 在 DMA 发送完成中断里恢复成 HAL_UART_STATE_READY。

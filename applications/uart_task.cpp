@@ -19,8 +19,8 @@ extern "C" void uart_task()
 }
 
 // 串口空闲中断 + DMA 收满
-// ⚠️ 全工程只有这一个定义（HAL 的回调是弱符号覆盖式的，不能有两个 .cpp 都实现）
-// ⚠️ DMA 半满(HT)事件也会进这个回调(HAL 没有关掉 HT 中断)，但半满不是"一批数据收完了"：
+//  全工程只有这一个定义（HAL 的回调是弱符号覆盖式的，不能有两个 .cpp 都实现）
+//  DMA 半满(HT)事件也会进这个回调(HAL 没有关掉 HT 中断)，但半满不是"一批数据收完了"：
 //      那时 DMA 还在往缓冲里写，解析到的是半帧；DBus 那边还会以错误长度提前返回。
 //      所以 HT 事件直接忽略，只处理空闲(IDLE)与收满(TC) —— 两者都表示 DMA 已经停下来了。
 extern "C" void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef * huart, uint16_t Size)

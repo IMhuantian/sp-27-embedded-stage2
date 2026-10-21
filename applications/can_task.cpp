@@ -1,23 +1,14 @@
 /*
- * 第二阶段: 底盘控制 + CAN 收发 (规则书 4.4.2.2 遥控器与底盘控制 / 4.4.2.3 功率控制)
- *
- * 硬件: 4×RM3508 + C620 电调, 接 CAN1(PD0/PD1), ID = 1/2/3/4(电调指示灯设定)
- *       功率计接 CAN2(0x301 两条总线都会收), 标准帧 8 字节
- *
- * 4.4.2.2 遥控映射(与本文件实现一一对应):
- *   右拨杆下档 → 全部电机失能(最高优先级, 每周期发 0 转矩)
+ *   右拨杆下档 → 全部电机失能(最高优先级)
  *   右拨杆中档 → 底盘可动
  *   左摇杆前后 → 前后移动                        (ch_lv)
  *   左摇杆左右 → 横向移动                        (ch_lh)
- *   左拨轮     → 原地旋转, 满量程目标角速度 1rad/s (ch_lu)
- *   右拨杆上档 → 本实现按失能处理(规则书未定义该档功能, 保守处理)
+ *   左拨轮     → 原地旋转(ch_lu)
+ *   右拨杆上档 → 自动行驶
  *
- * 控制链: 摇杆死区 → 目标速度斜坡 → 麦克纳姆解算 → 每轮速度环 PID
+ * 控制链: 摇杆 → 目标速度 → 麦克纳姆解算 → 每轮速度环 PID
  *         → 功率模型等比限流(80W 档 − 3W 余量) → 实测功率/电流兜底 → cmd(轮侧转矩 N·m)
  *         同时用四轮实测转速反解车体速度(vx/vy/wz), 与目标/反馈/控制量一起送 SerialPlot。
- *
- * ⚠️ 用法: 先按 CHASSIS_MOTION_ENABLE = false 编译烧录做 M2(纯失能, 交指定人员检查),
- *          检查通过后改成 true 再做 M3(运动, 车轮离地 + 低限幅)。
  */
 
 #include <cmath>
@@ -42,7 +33,7 @@ constexpr bool CHASSIS_MOTION_ENABLE = true;
 // 自检做完必须改回 false, 否则底盘永远不会动。
 constexpr bool ID_CHECK_MODE = false;
 
-// ---- 机械参数(规则书 4.4.2.2) ----
+// ---- 机械参数----
 constexpr float WHEEL_R = 0.077f;  // 轮半径 m (轮径 154mm)
 constexpr float HALF_L = 0.165f;   // 纵向半间距 m (纵向间距 330mm)
 constexpr float HALF_W = 0.185f;   // 横向半间距 m (横向间距 370mm)
@@ -50,36 +41,30 @@ constexpr float HALF_W = 0.185f;   // 横向半间距 m (横向间距 370mm)
 // ---- 减速比: 电机输出轴到轮 13.7:1 ----
 // 作用: RM_Motor 用它把电机侧原始数据换算成输出轴量纲 ——
 //   speed = rpm/60×2π/ratio (轮侧 rad/s)、torque = current×Kt×ratio (轮侧 N·m)、cmd() 也是轮侧 N·m。
-// 后果: 20A 对应的轮侧转矩 = (0.3/19.203)×20×13.7 ≈ 4.28 N·m (用 19.203 时是 6 N·m)。
-// 若哪天实测发现是 19.203:1, 只改这一行即可(读数会整体差 1.40 倍)。
+// 后果: 20A 对应的轮侧转矩 = (0.3/19.203)×20×13.7 ≈ 4.28 N·m。
 // ⚠️ 库里的 sp::M3508_P19(≈19.203) 不要用于这里。
 constexpr float GEAR_RATIO = 13.7f;
 
 // ---- 速度限幅 ----
 constexpr float V_MAX = 1.0f;   // 车体线速度上限 m/s (首测 1.0, 稳定后逐步放)
-constexpr float WZ_MAX = 1.0f;  // 旋转角速度上限 rad/s (规则书: 拨轮满量程 = 1)
+constexpr float WZ_MAX = 1.0f;  // 旋转角速度上限 rad/s (拨轮满量程 = 1)
 
-// ---- 摇杆死区(4.4.2.2 "方向应与操作者输入一致": 没死区时摇杆回中抖动会让底盘自己爬) ----
-// DT7 回中抖动实测在 ±0.01 量级; 死区内输出 0, 死区外线性重映射(过零连续, 满量程仍是 ±1)
+// ---- 摇杆死区----
 constexpr float STICK_DEADZONE = 0.02f;
 
-// ---- 目标速度斜坡(4.4.2.2 "直线行驶时应尽量减小偏航、振荡"; 同时充当软启动) ----
-constexpr float V_SLEW =
-  0.8f;  // 车体线速度变化率上限 m/s² (0 → 1m/s 约 1.25s; 2026-10-14 由 3.0 降下来)
+// ---- 目标速度斜坡----
+constexpr float V_SLEW = 0.8f;  // 车体线速度变化率上限 m/s² (0 → 1m/s 约 1.25s; 2026-10-14 由 3.0 降下来)
 constexpr float W_SLEW = 4.0f;  // 角速度变化率上限 rad/s²
 
-// ---- 方向标定(试车发现反了就把对应项改 -1, 不要动机械) ----
-// 这三项按"遥控器通道极性 × sp::Mecanum 约定"推出来, 不是猜的:
-//   dbus.hpp:70-72  ch_lv 上正下负 | ch_lh 右正左负 | ch_lu 左正右负
-//   mecanum.hpp:32-34  vx 前进为正 | vy 左移为正 | wz 逆时针(右手螺旋)为正
-// 所以"推杆方向 = 车动方向"要求: vx=+ch_lv, vy=-ch_lh, wz=+ch_lu
+// ---- 方向标定(试车发现反了就把对应项改 -1) ----
+// vx=+ch_lv, vy=-ch_lh, wz=+ch_lu
 constexpr float FWD_DIR = +1.0f;   // ch_lv 上推(+) = 前进
 constexpr float SIDE_DIR = -1.0f;  // ch_lh 右推(+) 要得到"右移", 而 vy 正方向是左移 → 取负
 constexpr float ROT_DIR = +1.0f;   // ch_lu 左推(+) = 左转, 而 wz 正方向就是逆时针(左转) → 取正
 
 // ---- 每轮速度环, 输出 = 轮侧转矩 N·m ----
 constexpr float SPD_DT = 1e-3f;  // 与控制周期 osDelay(1) 一致
-constexpr float SPD_KP = 0.9f;   // 整定起点, 见指南 M4
+constexpr float SPD_KP = 0.9f;   // 整定起点
 constexpr float SPD_KI = 0.02f;
 constexpr float SPD_KD = 0.0f;
 constexpr float SPD_MAX_OUT = 1.0f;   // 单轮转矩限幅 N·m (总输出限幅), 首测 1.0, 稳定后放 3.0
@@ -92,27 +77,25 @@ constexpr float YAW_KP = 0.6f;         // 偏航修正 P: 输出 rad/s / 偏差 
 constexpr float YAW_KD = 0.05f;        // 用 imu.vyaw 做阻尼
 constexpr float YAW_MAX = 0.25f;       // 偏航修正的上限 rad/s, 不允许抢主控制
 constexpr float STRAIGHT_EPS = 0.10f;  // |ch_lh|、|ch_lu| 都小于它才算"在走直线"
-// ⚠️ 符号标定(开启偏航锁定前必做): 失能状态下把车放平、俯视逆时针转 ~90°。
+//   符号标定: 失能状态下把车放平、俯视逆时针转 ~90°。
 //    若 imu.yaw 变大 → 与麦克纳姆 wz(逆时针为正)同号 → 保持 +1;
 //    若 imu.yaw 变小(例如 C 板倒装/绕 z 轴反向) → 改成 -1, 否则闭环变正反馈, 车会自己打转。
 constexpr float YAW_SIGN = +1.0f;
 
-// ---- 功率模型(4.4.2.3, 整定见指南 M5) ----
+// ---- 功率模型 ----
 // 模型: P = Σ(τ·ω) + K1·Στ² + K2·Σω² + K3   (轮侧 τ / N·m、ω / rad/s 口径)
-// 出处: 参考资料《底盘功率控制》"一、功率预测模型"。K1/K2 必须与喂进来的 τ、ω 同口径,
+// 出处: 参考资料《底盘功率控制》"一、功率预测模型"。K1/K2 必须与 τ、ω 同口径,
 // 本文件用的是轮侧量纲(主项 Στ·ω 与取哪一侧无关); 若哪天改用电机侧量纲, 修正项系数要按
-// i² 重算: K1/i²、K2×i²。下面只是参考初值, 必须按 M5 流程自己整定。
+// i² 重算: K1/i²、K2×i²。
 
-// ---- 功率上限(2026/10/15 按新到的手册改) ----
-// 《RM 2025 裁判系统 用户手册(中)V1.4》P19「规则参数设置」: 离线可把功率上限设成
-// 80 W / 120 W / Unlimited 三档; P11「机器人属性说明」写明「机器人底盘功率上限: 超过该
-// 限制及其能量时, 会对底盘进行断电」—— 超限不是扣分而是直接断电, 所以这里按保守档限流。
-// ⚠️ 正式比赛时这个值由服务器下发(还带"当前增益"), 而我们只解析 CAN 0x301 的电压/电流/
-//    功率, 读不到上限/缓冲能量/增益(那些在裁判系统用户串口协议里, 见该手册 P29 与
-//    《裁判系统串口协议说明》)。换档只改下面这一行; 将来若接上串口协议, 在这里改喂下发值。
-constexpr float POWER_LIMIT_W = 80.0f;         // ← 80 或 120(按本站规则选, 保守取 80)
+// ---- 功率上限 ----
+//    换档只改下面这一行; 将来若接上串口协议, 在这里改下发值。
+//    依据: RM 2025 裁判系统 用户手册 V1.4 P19(规则参数 80/120/Unlimited)、P11(超限直接断电);
+//          血量为零 / 缓冲能量耗尽时 PM02 自己切底盘供电, 由既有三层失能覆盖。
+//          底盘通道持续电流 10 A 见 PM02 使用说明书"产品参数"。
+constexpr float POWER_LIMIT_W = 80.0f;
 constexpr bool POWER_LIMIT_UNLIMITED = false;  // ← 规则参数设成 Unlimited 时才置 true
-constexpr float POWER_MARGIN_W = 3.0f;         // 限幅余量(出处见下)
+constexpr float POWER_MARGIN_W = 3.0f;         // 限幅余量
 constexpr float POWER_TARGET_W = POWER_LIMIT_W - POWER_MARGIN_W;  // 实际限幅目标: 80-3 = 77 W
 // 余量出处: 参考资料《底盘功率控制》"三、调试"——「实际限幅时把输入函数的限制功率 =
 // 裁判系统上限功率 − (2,5)W(取决于要激进还是保守)」。余量用来吸收模型误差 + 功率计采样
@@ -121,8 +104,6 @@ constexpr float POWER_TARGET_W = POWER_LIMIT_W - POWER_MARGIN_W;  // 实际限�
 constexpr float K1 = 1.8f;   // Στ² 系数(轮侧口径初值, 参考资料的"经验"值)
 constexpr float K2 = 0.01f;  // Σω² 系数(轮侧口径初值)
 constexpr float K3 = 4.2f;   // 静态功耗 W(底盘静止时实测整定)
-// 注: 《RM 电源模块 PM02 使用说明书》的"静态空载功耗 2.2 W"是电源模块自己的耗电, 不在
-//     底盘通道的测量口径里, 不能直接拿来当 K3。
 
 // ---- 第二轮限流: 实测反馈兜底 ----
 // 上面的功率模型是"前馈预测"; 真正决定裁判系统判罚与模块保护的是功率计实测值, 所以再加一层
@@ -140,17 +121,16 @@ constexpr float POWER_FEEDBACK_MIN_K = 0.2f;      // 兜底也不把转矩压到
 
 // ---- 功率整定视图(默认关) ----
 // 打开后 12 个 plot 通道换成"模型分项 + 测量值", 用来判断预测偏高/偏低到底出在哪一项
-// (此时通道含义与文档里的默认表不同, 整定完记得关掉):
 //   ch0 = Σ(τ·ω) 机械功率 W    ch1 = K1·Στ² 铜损项 W   ch2 = K2·Σω² 铁损项 W   ch3 = K3 W
 //   ch4 = p_pred 合计预测 W    ch5 = pm_power 实测 W    ch6 = pm_current 实测电流 A
 //   ch7..ch10 = 四轮指令转矩 N·m(lf/rf/lr/rr)          ch11 = mec.vx m/s
 constexpr bool POWER_TUNE_PLOT = false;
 
 // ---- 自动行驶: 右拨杆上档 → 前进固定距离后自动停车 ----
-// 拨杆语义(改后): 中档 = 手动遥控(摇杆); 上档 = 自动行驶 AUTO_DISTANCE_M 米; 下档 = 全部失能(不变)。
+// 拨杆语义: 中档 = 手动遥控(摇杆); 上档 = 自动行驶 AUTO_DISTANCE_M 米; 下档 = 全部失能(不变)。
 // 只在 CHASSIS_MOTION_ENABLE = true 且三层失能全部正常时才动作; 任何失能条件成立就放弃本次行驶。
-// 距离是闭环的: 边走边用实测车体速度 vx 积分, 走到 AUTO_DISTANCE_M 就停, 不是"发够时间"。
-constexpr bool AUTO_DRIVE_ENABLE = true;      // 不需要这个功能时置 false(上档回到"只发 0")
+// 距离是闭环的: 边走边用实测车体速度 vx 积分, 走到 AUTO_DISTANCE_M 就停。
+constexpr bool AUTO_DRIVE_ENABLE = true;      // 不需要这个功能时置 false
 constexpr float AUTO_DISTANCE_M = 3.3f;       // 要走的距离 m(沿车体前进方向)
 constexpr float AUTO_SPEED_MPS = 0.6f;        // 巡航速度 m/s (≤ V_MAX)
 constexpr float AUTO_ACCEL_MPS2 = V_SLEW;     // 加减速上限, 与手动斜坡同一个值(0.8 m/s²)
@@ -158,11 +138,7 @@ constexpr float AUTO_STOP_TOL_M = 0.03f;      // 剩余距离小于它就判到�
 constexpr uint32_t AUTO_TIMEOUT_MS = 15000u;  // 超时保护: 被卡住/空转打滑时也会停
 }  // namespace
 
-// ---- 底盘 4×C620 接在哪条 CAN 上（**接线必须与这里一致**）----
-// CAN1 = C 板上 2-pin 口（黑 CANL / 红 CANH）；CAN2 = 4-pin 口（灰 CANL / 灰 CANH / 灰 GND / 红 5V）
-// 已确认(2026/10/13): 底盘电机接 **CAN1**, 功率计接 CAN2。
-// 注意: 代码对两条总线都 config()+start() 且都解析 0x301, 所以功率计插错口也不会瞎。
-// 另一条总线同时留给以后云台的 GM6020。
+// ---- 底盘 4×C620 接在哪条 CAN 上----
 constexpr bool MOTORS_ON_CAN1 = true;
 
 sp::CAN can1(&hcan1);
@@ -172,7 +148,7 @@ sp::CAN & ocan = MOTORS_ON_CAN1 ? can2 : can1;  // 另一条: 只收 0x301(功�
 
 // 第三个参数 = 减速比, 必须显式传 GEAR_RATIO:
 // 默认值 1.0f 会让 speed/torque 变成"电机侧"量纲, 且 cmd() 的量程会差一个减速比。
-// 2026-10-14: 用户按 C620 绿灯闪烁次数确认实物位置。
+// 按 C620 绿灯闪烁次数确认实物位置。
 sp::RM_Motor wheel_lf(4, sp::RM_Motors::M3508, GEAR_RATIO);
 sp::RM_Motor wheel_rf(3, sp::RM_Motors::M3508, GEAR_RATIO);
 sp::RM_Motor wheel_lr(1, sp::RM_Motors::M3508, GEAR_RATIO);
@@ -231,7 +207,7 @@ uint32_t auto_last_ms = 0;   // 上一周期时刻(积分用实际步长)
 namespace
 {
 // 失能: 每周期向 4 台电机发 0 转矩指令, 清 PID 积分, 复位限流系数。
-// 失能状态具有最高优先级, 任何其它代码路径不得恢复输出(规则书 4.4.2.2)。
+// 失能状态具有最高优先级, 任何其它代码路径不得恢复输出。
 void disable_all()
 {
   wheel_lf.cmd(0.0f);
@@ -342,8 +318,6 @@ void chassis_step()
 
   // ---- 三层失能(最高优先级): 电机反馈中断 / 遥控器失联 / 右拨杆下档 ----
   // 另: 裁判系统在"血量为零"或"底盘功率超限且缓冲能量耗尽"时会直接切断底盘通道供电
-  // (《RM 2025 裁判系统 用户手册》V1.4 P5 血量为零自动切断动力电源 / P11 功率上限),
-  // 那时电调反馈消失, 本层会接管失能 —— 不需要为断电再写一套逻辑。
   // is_alive() = 距上次收到该电机反馈 < 100ms(见 rm_motor.cpp:103), 比 is_open() 更严:
   // 运行中拔掉/压断某台 C620 的通信线, 会立刻整机进入失能(单轮速度环失去反馈会失控)。
   if (
@@ -425,7 +399,7 @@ void chassis_step()
   spd_lr.calc(mec.speed_lr, wheel_lr.speed);
   spd_rr.calc(mec.speed_rr, wheel_rr.speed);
 
-  // 功率限流(4.4.2.3): 超限时四轮转矩等比缩小
+  //  超限时四轮转矩等比缩小
   k_power = power_scale(
     spd_lf.out, wheel_lf.speed, spd_rf.out, wheel_rf.speed, spd_lr.out, wheel_lr.speed, spd_rr.out,
     wheel_rr.speed);
@@ -451,7 +425,7 @@ void chassis_step()
   wheel_rr.cmd(k_power * spd_rr.out);
 
   // 车体速度反解(验收要展示"车体速度"; 也是直线行驶偏航漂移/速度不一致的客观证据)
-  // ⚠️ 形参顺序是 (lf, lr, rf, rr) —— lr 在 rf 前面, 别按 lf/rf/lr/rr 写
+  //  形参顺序是 (lf, lr, rf, rr) —— lr 在 rf 前面, 别按 lf/rf/lr/rr 写
   mec.update(wheel_lf.speed, wheel_lr.speed, wheel_rf.speed, wheel_rr.speed);
 
   // 自动行驶里程: 用实测车体前进速度 × 实际步长积分(只在本次行驶期间累加, 平时推车不计数)。
