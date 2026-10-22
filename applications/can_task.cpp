@@ -97,6 +97,23 @@ constexpr float POWER_LIMIT_W = 80.0f;
 constexpr bool POWER_LIMIT_UNLIMITED = false;  // ← 规则参数设成 Unlimited 时才置 true
 constexpr float POWER_MARGIN_W = 3.0f;         // 限幅余量
 constexpr float POWER_TARGET_W = POWER_LIMIT_W - POWER_MARGIN_W;  // 实际限幅目标: 80-3 = 77 W
+
+// 《SuperPower x MPS 杯 27 赛季校内赛规则手册 V2.1.0》§4.4.2.3 第 4 条 + §7.4.5:
+// "功率上限参数位于 pm02 类中，参赛人员应自行查阅并正确调用" —— 那个参数就是
+// sp_middleware/referee/pm02/pm02.hpp 里 robot_status.chassis_power_limit
+// (0x0201 机器人状态帧第 10~11 字节, 单位 W, 见 referee_protocol.hpp:243-260)。
+// 0x0201 走裁判系统用户串口(PM02 的 SM03B 3-pin), 8 字节 CAN 帧装不下, 所以:
+//   接上裁判系统串口后, 把 pm02.robot_status.chassis_power_limit 写进下面这个变量;
+//   没有数据(0)时退回规则手册给的 80 W, 保证拆掉裁判系统也能跑。
+uint16_t referee_power_limit_w = 0;  // >0: 用裁判系统下发的实时上限
+
+// 当前生效的限幅目标 = (裁判系统上限 或 规则书 80 W) - 余量
+float power_target_w()
+{
+  return (referee_power_limit_w > 0u)
+           ? (static_cast<float>(referee_power_limit_w) - POWER_MARGIN_W)
+           : POWER_TARGET_W;
+}
 // 余量出处: 参考资料《底盘功率控制》"三、调试"——「实际限幅时把输入函数的限制功率 =
 // 裁判系统上限功率 − (2,5)W(取决于要激进还是保守)」。余量用来吸收模型误差 + 功率计采样
 // 延迟, 避免瞬时超调撞上裁判系统的硬断电。
@@ -127,10 +144,12 @@ constexpr float POWER_FEEDBACK_MIN_K = 0.2f;      // 兜底也不把转矩压到
 constexpr bool POWER_TUNE_PLOT = false;
 
 // ---- 自动行驶: 右拨杆上档 → 前进固定距离后自动停车 ----
-// 拨杆语义: 中档 = 手动遥控(摇杆); 上档 = 自动行驶 AUTO_DISTANCE_M 米; 下档 = 全部失能(不变)。
+// 拨杆语义: 左拨杆上档 = 正式测试(自动行驶 AUTO_DISTANCE_M 米); 右拨杆 中/上档 = 手动遥控(摇杆),
+// 右拨杆下档 = 全部失能(最高优先级, 任何情况下都有效)。
 // 只在 CHASSIS_MOTION_ENABLE = true 且三层失能全部正常时才动作; 任何失能条件成立就放弃本次行驶。
 // 距离是闭环的: 边走边用实测车体速度 vx 积分, 走到 AUTO_DISTANCE_M 就停。
 constexpr bool AUTO_DRIVE_ENABLE = true;      // 不需要这个功能时置 false
+constexpr bool AUTO_TRIGGER_ON_LEFT = true;   // true = 左拨杆上档触发自动行驶（正式测试）；false = 右拨杆上档
 constexpr float AUTO_DISTANCE_M = 3.3f;       // 要走的距离 m(沿车体前进方向)
 constexpr float AUTO_SPEED_MPS = 0.6f;        // 巡航速度 m/s (≤ V_MAX)
 constexpr float AUTO_ACCEL_MPS2 = V_SLEW;     // 加减速上限, 与手动斜坡同一个值(0.8 m/s²)
@@ -229,7 +248,7 @@ void disable_all()
   if (auto_state == AutoState::RUN) {
     auto_state = AutoState::STOP;
   }
-  if (remote.sw_r != sp::DBusSwitchMode::UP) {
+  if (remote.sw_l != sp::DBusSwitchMode::UP) {
     auto_state = AutoState::IDLE;  // 拨杆已经离开上档 → 直接复位, 下次切上来是全新一次
   }
   // 让 SerialPlot 上直接看出"已失能": 目标/控制量归零(实际轮速仍显示真实值)
@@ -284,11 +303,11 @@ float power_scale(float t1, float w1, float t2, float w2, float t3, float w3, fl
   p_t1 = K1 * sum_t2;                      // 整定视图分项
   p_t2 = K2 * sum_w2;                      // 整定视图分项
   if (POWER_LIMIT_UNLIMITED) return 1.0f;  // 规则参数设成 Unlimited: 不做功率限幅
-  if (p_pred <= POWER_TARGET_W) return 1.0f;
+  if (p_pred <= power_target_w()) return 1.0f;
 
   const float a = K1 * sum_t2;
   const float b = sum_tw;
-  const float c = K2 * sum_w2 + K3 - POWER_TARGET_W;
+  const float c = K2 * sum_w2 + K3 - power_target_w();
   const float disc = b * b - 4.0f * a * c;
   // 兜底: 判别式<0 只可能发生在 c>0(即"零转矩下预测功率都已超限")——此时 K'∈[0,1] 内
   // 功率随 K' 单调上升, 最小值在 K'=0, 所以直接给 0 转矩最安全(而不是给一个固定系数)
@@ -329,8 +348,10 @@ void chassis_step()
 
   // ---- 运动使能: 中档 = 手动遥控; 上档 = 自动行驶(见 AUTO_* 常量); 其它 = 只发 0 ----
   // ---- M2 阶段(CHASSIS_MOTION_ENABLE = false)到此为止: 永远失能, 不做任何运动 ----
-  const bool manual_mode = remote.sw_r == sp::DBusSwitchMode::MID;
-  const bool auto_mode = AUTO_DRIVE_ENABLE && remote.sw_r == sp::DBusSwitchMode::UP;
+  // 左拨杆上档 = 正式测试：自动行驶；右拨杆非下档 = 手动（下档已在上面整体失能）
+  const bool auto_mode =
+    AUTO_DRIVE_ENABLE && AUTO_TRIGGER_ON_LEFT && (remote.sw_l == sp::DBusSwitchMode::UP);
+  const bool manual_mode = !auto_mode;
 
   if (!CHASSIS_MOTION_ENABLE || (!manual_mode && !auto_mode)) {
     disable_all();
@@ -408,7 +429,8 @@ void chassis_step()
   if (POWER_FEEDBACK_CLAMP_ENABLE && pm_data_valid(now)) {
     pm_power_f += PM_POWER_FILTER_ALPHA * (pm_power - pm_power_f);  // 低通, 抑制单帧噪声
     float k_fb = 1.0f;
-    if (pm_power_f > POWER_TARGET_W) k_fb = POWER_TARGET_W / pm_power_f;
+    const float target_w = power_target_w();
+    if (pm_power_f > target_w) k_fb = target_w / pm_power_f;
     if (pm_current > PM_CURRENT_CONT_LIMIT_A) {
       const float k_i = PM_CURRENT_CONT_LIMIT_A / pm_current;  // 模块底盘通道持续电流上限
       if (k_i < k_fb) k_fb = k_i;
