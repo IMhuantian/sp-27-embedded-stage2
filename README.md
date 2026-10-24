@@ -21,7 +21,7 @@
 
 - **失能优先**：右拨杆下档 → 四轮电机停止输出。**三层失能**（拨杆下档 / 遥控器失联 / 任一电机反馈中断 >100 ms）都走同一个 `disable_all()`，进入失能时目标速度与斜坡状态一起清零。
 - **遥控映射**（规则书 4.4.2.2）：右拨杆中档才可动（左拨杆上档时由正式测试序列接管）；左摇杆前后 = 前进后退；左摇杆左右 = 左右横移；拨轮 = 自转（满量程 1 rad/s）；摇杆带 2% 死区与线性重映射。
-- **正式测试触发（左拨杆上档）**：左拨杆**上档** → 车沿前进方向自动走 `AUTO_DISTANCE_M = 3.3 m` 后停住并保持不动（距离用实测车体速度积分闭环，速度走 `v = √(2as)` 梯形曲线，加减速复用 `V_SLEW` 斜坡）；上档期间摇杆无效，中途失能则放弃本次且**不会自动重新起步**（要重跑必须把拨杆拨离上档再切回）。
+- **正式测试触发（左拨杆上档）**：左拨杆**上档** → 车沿前进方向自动走 `AUTO_DISTANCE_M = 3.75 m` 后停住并保持不动（距离用实测车体速度积分闭环，速度走 `v = √(2as)` 梯形曲线，加减速复用 `V_SLEW` 斜坡）；上档期间摇杆无效，中途失能则放弃本次且**不会自动重新起步**（要重跑必须把拨杆拨离上档再切回）。
 - **速度规划**：目标速度经斜坡限幅（`V_SLEW = 0.8 m/s²`、`W_SLEW = 4 rad/s²`），抑制起步冲击与松手后的爬行。
 - **麦轮运动学**：`sp::Mecanum` 逆解到四轮线速度 → 每轮速度环 PID（总输出与积分分项分别限幅）→ 轮侧转矩 → C620 电流指令。
 - **车体速度反解**：四轮反馈反解出实测 `vx / vy / wz`，供 SerialPlot 与验收展示（规则书要求能算车体速度）。
@@ -35,7 +35,7 @@
 | 任务 | 优先级 | 栈（word） | 入口 | 说明 |
 | --- | --- | --- | --- | --- |
 | defaultTask | Normal | 128 | `defaultTask` | CubeMX 默认任务 |
-| PlotterTask | Low | 128 | `plotter_task` | 1 ms 往 SerialPlot 发一帧 12 通道波形 |
+| PlotterTask | Low | 128 | `plotter_task` | 1 ms 往 SerialPlot 发一帧 13 通道波形 |
 | CanTask | Low | 256 | `can_task` | **底盘主任务**：1 ms 控制周期，遥控解析 → 麦轮逆解 → PID → 功率限制 → CAN 发送 |
 | ImuTask | AboveNormal | 512 | `imu_task` | BMI088 + Mahony，1 kHz |
 | UartTask | Normal | 256 | `uart_task` | 接收机中断/DMA，只负责挂 DMA 与解析 |
@@ -70,8 +70,8 @@
 | `AUTO_DRIVE_ENABLE` | `true` | 正式测试自动行驶总开关（`false` = 回到纯手动遥控） |
 | `AUTO_TRIGGER_ON_LEFT` | `true` | 触发源：`true` = 左拨杆上档（正式）；`false` = 右拨杆上档 |
 | `referee_power_limit_w` | `0` | 裁判系统实时功率上限（0 = 用规则书 80 W）；接上 PM02 用户串口后由 `pm02.robot_status.chassis_power_limit` 写入 |
-| `AUTO_DISTANCE_M` | 3.3 m | 上档自动行驶的距离（换距离只改这一行） |
-| `AUTO_SPEED_MPS` | 0.6 m/s | 自动行驶巡航速度（≤ `V_MAX`） |
+| `AUTO_DISTANCE_M` | 3.75 m | 上档自动行驶的距离（换距离只改这一行） |
+| `AUTO_SPEED_MPS` | 0.42 m/s | 自动行驶巡航速度（≤ `V_MAX`；0.6 降低 30%） |
 | `AUTO_STOP_TOL_M` / `AUTO_TIMEOUT_MS` | 0.03 m / 15 s | 到位容差 / 超时保护 |
 | `FWD_DIR / SIDE_DIR / ROT_DIR` | +1 / -1 / +1 | 整车方向极性（推导依据见文件内注释） |
 | `SPD_KP / SPD_KI / SPD_KD` | 0.9 / 0.02 / 0.0 | 轮速环 PID（2026-10-14 队友整定） |
@@ -87,13 +87,13 @@
 
 - 预测模型：`P = Σ(τ·ω) + K1·Στ² + K2·Σω² + K3`（轮侧 τ / N·m、ω / rad/s；K1/K2/K3 是电机 + 电调损耗系数，仍待实测标定）。
 - **上限与余量（2026-10-15 按新到手的手册更新）**：《RM 2025 裁判系统 用户手册（中）V1.4》P19「规则参数设置」只有 **80 / 120 / Unlimited** 三档；P11「机器人属性说明」写明"超过该限制及其能量时，会对底盘进行断电"。因此取保守档 `POWER_LIMIT_W = 80 W`，再按参考资料《底盘功率控制》"三、调试"的建议留 `POWER_MARGIN_W = 3 W` 余量 → 实际限幅 `POWER_TARGET_W = 77 W`。规则参数设成 Unlimited 时把 `POWER_LIMIT_UNLIMITED` 置 `true`。比赛时上限由服务器下发，而本工程只解析 CAN `0x301` 的电压/电流/功率，**读不到上限 / 缓冲能量 / 增益**（那些在裁判系统用户串口协议里，见该手册 P29 与《裁判系统串口协议说明》）。
-- 超限时四轮转矩**等比**缩减（不改变车体运动方向），限制后的指令写入 SerialPlot 供验收对照。
+- 超限时四轮转矩**等比**缩减（不改变车体运动方向），限制后的指令写入 SerialPlot 供验收对照。**当前生效的限幅目标（功率上限）本身也占一个波形通道（通道 13，`POWER_TARGET_W` 或裁判系统上限 − 余量）**，与通道 8 预测功率、通道 9 功率计实测同图对照即可判断是否压住上限。
 - **第二轮实测兜底（只减不增）**：实测功率（一阶低通约 5 ms）超 `POWER_TARGET_W` → 按 `目标/实测` 再乘一次；实测电流超 `PM_CURRENT_CONT_LIMIT_A = 10 A`（PM02 底盘通道最大持续负载，《RM 电源模块 PM02 使用说明书》产品参数：10 A 持续 / 30 A（<500 ms）/ 三通道合计 20 A）→ 按 `10/实测` 压；最低压到 `POWER_FEEDBACK_MIN_K = 0.2`。`0x301` 超 `PM_DATA_TIMEOUT_MS = 100 ms` 未更新就当没有功率计，该层自动失效（行为与改动前一致）。
 - 实测功率计帧：CAN2 上标准帧 `0x301`，Data[0:1] = 电流×100（int16，可负）、[2:3] = 电压×100（uint16）、[4:5] = 功率×100（uint16）、[6:7] = 0（解析见 `can_task.cpp` 的 `parse_power()`）。
 
 ## 注意事项
 
-- `applications/can_task.cpp` 里 `plot_ch[12]`、`applications/plotter_task.cpp` 里 12 通道波形与 `sp::Mecanum::update()` 的形参顺序（`lf, lr, rf, rr`，**lr 在 rf 前**）三处要一起改。
+- `applications/can_task.cpp` 里 `plot_ch[13]`、`applications/plotter_task.cpp` 里 13 通道波形与 `sp::Mecanum::update()` 的形参顺序（`lf, lr, rf, rr`，**lr 在 rf 前**）三处要一起改。
 - SerialPlot 的 DMA 帧缓冲：`plotter_task.cpp` 里用 `huart1.gState == HAL_UART_STATE_READY` 做门控，避免在 DMA 还没读完上一帧时改写缓冲（否则波形错位）。
 - DT7 的 DMA 半满（HT）事件不是"一批数据收完"，`uart_task.cpp` 里已显式忽略 `HAL_UART_RXEVENT_HT`。
 - `sp_middleware` 是 submodule（上游 `TongjiSuperPower/sp_middleware`，指向 `eddf9a35`，本工程未修改其中任何文件）。SerialPlot 的 DMA 帧缓冲门控是**应用层**改动，在 `applications/plotter_task.cpp`。克隆后需 `git submodule update --init --recursive`。

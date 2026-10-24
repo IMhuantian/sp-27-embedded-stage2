@@ -1,19 +1,24 @@
 #include "cmsis_os.h"
 #include "io/dbus/dbus.hpp"
+#include "referee/pm02/pm02.hpp"
 
 // DT7 接收机接在 USART3 上(PC10=TX / PC11=RX)，100000bps / 偶校验 / 8 数据位 / 1 停止位，
 // 这些都在 cboard.ioc 里配好了，接收走 DMA1_Stream1
-// 注意: 本板(底盘 C 板)只接 DT7。GY-56 用的 USART6 在**云台 C 板**工程(..\files\stage_2_gimbal)里，
-//       两块板各自读自己的接收机与传感器，不互相转发。
+// 底盘UART1（USART6，9600 8N1）接PM02用户串口；云台的测距仪属于另一块板。
 sp::DBus remote(&huart3);
+sp::PM02 pm02(&huart6);
 
 extern "C" void uart_task()
 {
   remote.request();
+  pm02.request();
 
   while (true) {
     // remote 上的数据：ch_lh / ch_lv / ch_rh / ch_rv / ch_lu 是摇杆和拨轮，范围 [-1, 1]；
     // sw_l / sw_r 是左右三位开关；is_alive() 看接收机在不在线
+    taskENTER_CRITICAL();
+    pm02.update_radar_data_timeout(HAL_GetTick());
+    taskEXIT_CRITICAL();
     osDelay(10);
   }
 }
@@ -33,10 +38,15 @@ extern "C" void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef * huart, uint16_t 
     remote.update(Size, stamp_ms);
     remote.request();
   }
+  else if (huart == pm02.huart) {
+    pm02.update(Size);
+    pm02.request();
+  }
 }
 
 // 收出错的时候重新挂 DMA
 extern "C" void HAL_UART_ErrorCallback(UART_HandleTypeDef * huart)
 {
   if (huart == &huart3) remote.request();
+  else if (huart == pm02.huart) pm02.request();
 }

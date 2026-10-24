@@ -58,6 +58,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 
     applications/uart_task.cpp
     sp_middleware/io/dbus/dbus.cpp
+    sp_middleware/referee/pm02/pm02.cpp
+    sp_middleware/tools/crc/crc.cpp
 
     applications/plotter_task.cpp
     sp_middleware/io/plotter/plotter.cpp

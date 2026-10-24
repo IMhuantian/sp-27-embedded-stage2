@@ -141,6 +141,7 @@ constexpr float POWER_FEEDBACK_MIN_K = 0.2f;      // 兜底也不把转矩压到
 //   ch0 = Σ(τ·ω) 机械功率 W    ch1 = K1·Στ² 铜损项 W   ch2 = K2·Σω² 铁损项 W   ch3 = K3 W
 //   ch4 = p_pred 合计预测 W    ch5 = pm_power 实测 W    ch6 = pm_current 实测电流 A
 //   ch7..ch10 = 四轮指令转矩 N·m(lf/rf/lr/rr)          ch11 = mec.vx m/s
+//   ch12 = 功率上限(限幅目标) W ← 两种视图都发, 与预测/实测同图对照
 constexpr bool POWER_TUNE_PLOT = false;
 
 // ---- 自动行驶: 右拨杆上档 → 前进固定距离后自动停车 ----
@@ -150,8 +151,8 @@ constexpr bool POWER_TUNE_PLOT = false;
 // 距离是闭环的: 边走边用实测车体速度 vx 积分, 走到 AUTO_DISTANCE_M 就停。
 constexpr bool AUTO_DRIVE_ENABLE = true;      // 不需要这个功能时置 false
 constexpr bool AUTO_TRIGGER_ON_LEFT = true;   // true = 左拨杆上档触发自动行驶（正式测试）；false = 右拨杆上档
-constexpr float AUTO_DISTANCE_M = 3.3f;       // 要走的距离 m(沿车体前进方向)
-constexpr float AUTO_SPEED_MPS = 0.6f;        // 巡航速度 m/s (≤ V_MAX)
+constexpr float AUTO_DISTANCE_M = 3.75f;      // 要走的距离 m(沿车体前进方向)
+constexpr float AUTO_SPEED_MPS = 0.55f;       // 巡航速度 m/s (≤ V_MAX; 0.42 提高 30% ≈ 0.55)
 constexpr float AUTO_ACCEL_MPS2 = V_SLEW;     // 加减速上限, 与手动斜坡同一个值(0.8 m/s²)
 constexpr float AUTO_STOP_TOL_M = 0.03f;      // 剩余距离小于它就判到位(3 cm)
 constexpr uint32_t AUTO_TIMEOUT_MS = 15000u;  // 超时保护: 被卡住/空转打滑时也会停
@@ -201,11 +202,12 @@ float vx_ramp = 0.0f;
 float vy_ramp = 0.0f;
 float wz_ramp = 0.0f;
 
-// 给 plotter_task 的 12 通道(SerialPlot 一帧 = 3 + 12×4 = 51 字节, 921600 下 1ms 周期够用):
+// 给 plotter_task 的 13 通道(SerialPlot 一帧 = 3 + 13×4 = 55 字节, 921600 下 1ms 周期够用):
 // 0 目标轮速(左前) 1 实际轮速(左前) 2 控制量(左前) 3/4/5 右前/左后/右后实际轮速
 // 6 偏航 yaw 7 预测功率 8 功率计实测功率
 // 9/10/11 车体实测 vx/vy/wz(由四轮反馈反解) ← 规则书"车体速度"与直线行驶证据
-float plot_ch[12] = {0};
+// 12 功率上限(当前生效的限幅目标 W; 规则上限 80 W − 3 W 余量 = 77 W, 接裁判系统后随下发值变)
+float plot_ch[13] = {0};
 
 // 直线偏航锁定状态
 bool yaw_lock_active = false;
@@ -473,6 +475,7 @@ void chassis_step()
     plot_ch[9] = spd_lr.out;   // 左后指令转矩 N·m
     plot_ch[10] = spd_rr.out;  // 右后指令转矩 N·m
     plot_ch[11] = mec.vx;      // 车体实测 vx m/s
+    plot_ch[12] = power_target_w();  // 功率上限(限幅目标) W
   }
   else {
     plot_ch[0] = mec.speed_lf;          // 目标轮速(左前) rad/s
@@ -487,6 +490,7 @@ void chassis_step()
     plot_ch[9] = mec.vx;                // 车体实测 vx m/s (前进为正)
     plot_ch[10] = mec.vy;               // 车体实测 vy m/s (左移为正)
     plot_ch[11] = mec.wz;               // 车体实测 wz rad/s (逆时针为正)
+    plot_ch[12] = power_target_w();     // 功率上限(限幅目标) W: 预测/实测都该压在它下面
   }
 }
 }  // namespace
